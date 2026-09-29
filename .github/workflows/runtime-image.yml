@@ -4,6 +4,11 @@ name: Runtime image
 # releasing the app — that is driven by `release-*` tags in testflight.yml.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  # Run it by hand on a branch to build (and publish under a sha- tag) the
+  # image before merging.
   workflow_dispatch:
 
 env:
@@ -50,6 +55,9 @@ jobs:
 
   image:
     needs: test
+    # Pull requests only test. Publishing happens from main, from v* tags and
+    # from a manual run.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,6 +96,14 @@ jobs:
             echo "base=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
             echo "ollama=${BASE}:${SHA}-ollama" >> "$GITHUB_OUTPUT"
           fi
+          # A v1.2.3 tag additionally publishes an immutable 1.2.3 image.
+          case "${{ github.ref }}" in
+            refs/tags/v*)
+              V="${GITHUB_REF_NAME#v}"
+              echo "base=${BASE}:${SHA},${BASE}:${V},${BASE}:v1" >> "$GITHUB_OUTPUT"
+              echo "ollama=${BASE}:${SHA}-ollama,${BASE}:${V}-ollama,${BASE}:v1-ollama" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
           echo "primary=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
           echo "version=${SHA}" >> "$GITHUB_OUTPUT"
           echo "cacheref=${BASE}:buildcache" >> "$GITHUB_OUTPUT"
