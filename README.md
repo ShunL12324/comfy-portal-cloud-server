@@ -147,11 +147,32 @@ make test     # go vet + go test -race
 make e2e      # needs aria2c, curl, jq; picks free ports, no network, no GPU
 make build    # bin/cpd
 make image    # the full CUDA image (amd64 host, ~20 GB)
+make vast-smoke IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-abc1234   # a few cents
 ```
 
 `test/e2e.sh` covers the failures that have already happened: a model 404 must not stop the
 other models or ComfyUI starting; killing ComfyUI must bring it back with `restarts`
 incremented; a restart must skip files already on disk; and no secret may appear in any log.
+
+### On a real GPU
+
+`test/vast-smoke.sh` rents the cheapest reliable RTX 30/40-series card on vast.ai, launches
+the published image **exactly the way the app does** (`ssh_direct`, the app's `onstart` line,
+`CP_*` env as `-e` flags), drives the supervisor over SSH-loopback curl like the app, and
+always destroys the instance. It checks boot to `ready` with a real HF model and a real
+extension, CUDA visibility, the v1 and v2 APIs, secret redaction, `kill -9` recovery, applying
+a manifest, graceful shutdown and a resuming relaunch. Needs `VAST_API_KEY`; a run costs a few
+cents. Hosts whose docker daemon is broken (`unresolvable CDI devices`, containerd errors,
+never starting) are detected, destroyed and skipped automatically.
+
+It exists because two bugs were invisible to every other test:
+
+- vast starts its own `sshd`, which needs host keys. The image ships none (baked-in keys
+  would be shared by everyone who pulls it), so `/usr/sbin/sshd` is a wrapper that generates
+  them on first start.
+- On vast `/workspace` is a different filesystem from the image layer, so moving the image's
+  `custom_nodes` and `models` there with `rename(2)` failed with `EXDEV`. It now falls back to
+  copy-then-delete, through a `.partial` directory so an interrupted copy is never trusted.
 
 CI (`.github/workflows/runtime-image.yml`) runs gofmt, vet, `go test -race` (with the app's
 TypeScript client as a contract check), golangci-lint and the e2e before it builds and

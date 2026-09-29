@@ -1,4 +1,4 @@
-.PHONY: build test e2e lint image
+.PHONY: build test e2e lint image vast-smoke
 
 VERSION ?= dev
 
@@ -18,3 +18,8 @@ lint:
 
 image:
 	docker build --build-arg VERSION=$(VERSION) -t comfy-portal-cloud-server:dev .
+
+# Rents a cheap GPU on vast.ai and tests the published image on it. Costs cents.
+vast-smoke:
+	@test -n "$(IMAGE)" || { echo "usage: make vast-smoke IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-..."; exit 1; }
+	IMAGE=$(IMAGE) test/vast-smoke.sh
