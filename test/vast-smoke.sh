@@ -139,6 +139,9 @@ else
   bad "ssh never worked in ${SSH_WAIT}s"
   ssh -v -p "$SSHPORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes "root@$IP" true 2>&1 | tail -12 | sed 's/^/    /'
   vast "$API/instances/$INSTANCE/" | jq -r '.instances | "    vast: status=\(.actual_status) msg=\(.status_msg|tostring|.[0:300])"'
+  echo "    --- container log (vast request_logs)"
+  LOGURL=$(vast -X PUT "$API/instances/request_logs/$INSTANCE/" -d '{"tail":"120","daemon_logs":"true"}' | jq -r '.result_url // empty')
+  [ -n "$LOGURL" ] && { sleep 8; curl -fsS -m 30 "$LOGURL" | tail -40 | cut -c1-200 | sed 's/^/    /'; }
   exit 1
 fi
 
