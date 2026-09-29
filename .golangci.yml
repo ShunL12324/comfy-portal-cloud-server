@@ -1,0 +1,19 @@
+version: "2"
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - bodyclose
+    - noctx
+    - gosec
+  settings:
+    gosec:
+      excludes:
+        - G204 # commands are built from validated manifest fields, never a shell
+        - G304 # log paths come from a fixed stream allowlist
+        - G301
+        - G302
+        - G306
+formatters:
+  enable:
+    - gofmt

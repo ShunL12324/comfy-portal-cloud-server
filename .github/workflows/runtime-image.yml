@@ -13,92 +13,43 @@ env:
   IMAGE_NAME: comfy-portal-runtime
 
 jobs:
-  # Fast gate. Exercises the supervisor against a stub ComfyUI and fixtures
-  # served over loopback — no CUDA, no network, no GPU — so a logic regression
-  # is caught in under a minute rather than by a rental.
-  supervisor-test:
+  # Fast gate: unit tests, then the real binary against real aria2c, a stub
+  # ComfyUI and fixture models over loopback. No CUDA, no network, no GPU, so a
+  # logic regression is caught in a couple of minutes rather than by a rental.
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The status contract is checked against the app's TypeScript client.
+      # The v1 compatibility shape is checked against the app's TypeScript client.
       - uses: actions/checkout@v4
         with:
           repository: ShunL12324/comfy-portal
           path: app
 
-      - name: Build test rig
-        run: docker build -f test/Dockerfile -t cp-supervisor-test .
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
-      - name: Smoke test
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet and unit tests
         run: |
-          MANIFEST=$(python3 -c "
-          import base64, json
-          print(base64.b64encode(json.dumps({
-            'version': 1,
-            'models': [
-              {'url': 'http://127.0.0.1:8000/tiny-model.safetensors', 'folder': 'checkpoints', 'filename': 't.safetensors'},
-              {'url': 'http://127.0.0.1:8000/second-model.safetensors', 'folder': 'loras', 'filename': 's.safetensors'},
-            ],
-            'extensions': [], 'ollamaModels': [],
-          }).encode()).decode())")
+          go vet ./...
+          CP_APP_DIR=$PWD/app go test -race ./...
 
-          docker run -d --name cp-test -p 18189:8189 \
-            -e CP_TOKEN=ci-token-abcdefgh -e CP_MANIFEST="$MANIFEST" cp-supervisor-test
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
 
-          for _ in $(seq 1 30); do
-            sleep 2
-            STATUS=$(curl -s -H "Authorization: Bearer ci-token-abcdefgh" http://localhost:18189/v1/status || true)
-            echo "$STATUS" | grep -q '"phase": "ready"' && break
-            echo "$STATUS" | grep -q '"phase": "failed"' && { echo "$STATUS"; exit 1; }
-          done
-
-          echo "$STATUS" | python3 -c "
-          import json, sys
-          d = json.load(sys.stdin)
-          assert d['phase'] == 'ready', d
-          assert d['totals']['completed'] == d['totals']['bytes'] > 0, d['totals']
-          print('ready:', d['totals'])"
-
-          # An unauthenticated request must not reach status; the port is public
-          # on a real instance.
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18189/v1/status)" = 401
-
-          # The supervisor and the app are written in different languages and
-          # live in different repositories; nothing but this stops a renamed
-          # field from silently becoming undefined on the phone.
-          echo "$STATUS" > /tmp/snapshot.json
-          python3 - <<'CONTRACT'
-          import json, re, sys
-          snapshot = json.load(open('/tmp/snapshot.json'))
-          ts = open('app/src/services/cloud-supervisor.ts').read()
-
-          def required(name, until):
-              # `field?:` is optional by design — errorCode only exists on a
-              # failure — so only non-optional fields must always be present.
-              block = ts[ts.index(f'export interface {name}'):ts.index(until)]
-              return set(re.findall(r'^\s{2}(\w+):', block, re.M))
-
-          problems = []
-          missing = required('SupervisorSnapshot', 'export class SupervisorError') - set(snapshot)
-          if missing:
-              problems.append(f'snapshot fields declared but not sent: {sorted(missing)}')
-
-          sent = set().union(*[set(m) for m in snapshot['models']])
-          missing = required('SupervisorModel', 'export interface SupervisorSnapshot') - sent
-          if missing:
-              problems.append(f'model fields declared but not sent: {sorted(missing)}')
-
-          if problems:
-              print('\n'.join(problems))
-              sys.exit(1)
-          print('client contract holds')
-          CONTRACT
-
-          docker rm -f cp-test
+      - name: End to end
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 jq
+          test/e2e.sh
 
   image:
-    needs: supervisor-test
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -138,6 +89,7 @@ jobs:
             echo "ollama=${BASE}:${SHA}-ollama" >> "$GITHUB_OUTPUT"
           fi
           echo "primary=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${SHA}" >> "$GITHUB_OUTPUT"
           echo "cacheref=${BASE}:buildcache" >> "$GITHUB_OUTPUT"
 
       - name: Build and push base
@@ -145,6 +97,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          build-args: VERSION=${{ steps.tags.outputs.version }}
           # vast's GPU hosts are x86 only; an arm64 variant would never be pulled.
           platforms: linux/amd64
           push: true

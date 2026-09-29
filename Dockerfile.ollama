@@ -19,4 +19,4 @@ RUN apt-get update -qq && \
     curl -fsSL https://ollama.com/install.sh | sh && \
     ollama --version
 
-ENTRYPOINT ["python", "/opt/cp/supervisor.py"]
+ENTRYPOINT ["tini", "--", "cpd", "serve"]
