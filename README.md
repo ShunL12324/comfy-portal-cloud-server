@@ -1,11 +1,11 @@
-# Cloud supervisor
+# Comfy Portal cloud server
 
 The Docker image a rented GPU boots into, and the program that runs inside it.
 
 **This directory shares no code with the app.** It is Python and Dockerfiles;
 nothing here is bundled into the React Native build, and nothing here imports
 from the app. The only contract between the two is the HTTP API below, which
-`services/cloud-supervisor.ts` consumes.
+[`src/services/cloud-supervisor.ts`](https://github.com/ShunL12324/comfy-portal/blob/main/src/services/cloud-supervisor.ts) in the app consumes.
 
 ## Why an image rather than a script
 
