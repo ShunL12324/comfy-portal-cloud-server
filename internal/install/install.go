@@ -130,7 +130,9 @@ func copyTree(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			return os.Symlink(link, target)
+			// The tree being copied is the image's own ComfyUI checkout, read at boot
+			// before anything untrusted runs, so there is no one to race the walk.
+			return os.Symlink(link, target) //nolint:gosec // G122: trusted source, see above
 		case d.Type().IsRegular():
 			return copyFile(path, target, info.Mode().Perm())
 		}
