@@ -9,7 +9,7 @@
 # template, and a couple of 8B models would add more to the image than the whole
 # rest of the stack.
 
-ARG BASE=ghcr.io/shunl12324/comfy-portal-runtime:dev
+ARG BASE=ghcr.io/shunl12324/comfy-portal-cloud-server:dev
 FROM ${BASE}
 
 # zstd is what Ollama's installer now unpacks with, and it isn't in the base.

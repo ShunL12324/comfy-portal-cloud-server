@@ -17,4 +17,4 @@ lint:
 	golangci-lint run
 
 image:
-	docker build --build-arg VERSION=$(VERSION) -t comfy-portal-runtime:dev .
+	docker build --build-arg VERSION=$(VERSION) -t comfy-portal-cloud-server:dev .
