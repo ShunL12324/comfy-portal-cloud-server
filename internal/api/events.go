@@ -30,7 +30,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	if last == 0 || gap {
 		replay = nil
 		payload, _ := json.Marshal(s.snapshot())
-		fmt.Fprintf(w, "id: %d\nevent: snapshot\ndata: %s\n\n", s.State.Hub.LastID(), payload)
+		_, _ = fmt.Fprintf(w, "id: %d\nevent: snapshot\ndata: %s\n\n", s.State.Hub.LastID(), payload)
 	}
 	for _, ev := range replay {
 		writeEvent(w, ev.ID, ev.Type, ev.Data)
@@ -51,7 +51,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			}
 			writeEvent(w, ev.ID, ev.Type, ev.Data)
 		case <-tick.C:
-			fmt.Fprint(w, ": ping\n\n")
+			_, _ = fmt.Fprint(w, ": ping\n\n")
 		}
 		if rc.Flush() != nil {
 			return
@@ -60,5 +60,5 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeEvent(w http.ResponseWriter, id uint64, typ string, data []byte) {
-	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", id, typ, data)
+	_, _ = fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", id, typ, data)
 }

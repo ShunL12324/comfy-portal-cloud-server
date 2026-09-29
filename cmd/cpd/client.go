@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,7 +27,7 @@ func baseURL() string {
 }
 
 func get(path string, timeout time.Duration) ([]byte, int, error) {
-	req, err := http.NewRequest(http.MethodGet, baseURL()+path, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, baseURL()+path, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -37,7 +38,7 @@ func get(path string, timeout time.Duration) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("supervisor is not answering: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	return body, resp.StatusCode, err
 }

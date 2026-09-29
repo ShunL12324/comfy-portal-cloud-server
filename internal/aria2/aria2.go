@@ -81,7 +81,7 @@ func (c *Client) call(ctx context.Context, method string, params ...any) (json.R
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var body struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {

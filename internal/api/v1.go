@@ -158,7 +158,7 @@ func (s *Server) legacyEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	send := func() bool {
 		payload, _ := json.Marshal(s.legacySnapshot())
-		fmt.Fprintf(w, "data: %s\n\n", payload)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
 		return rc.Flush() == nil
 	}
 	if !send() {

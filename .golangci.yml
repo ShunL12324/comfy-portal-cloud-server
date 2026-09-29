@@ -14,6 +14,12 @@ linters:
         - G301
         - G302
         - G306
+  exclusions:
+    rules:
+      # Tests and the e2e rig talk to loopback servers they own; context
+      # plumbing and close-error checks there are noise.
+      - path: '(_test\.go|^test/)'
+        linters: [noctx, bodyclose, errcheck, gosec, errorlint]
 formatters:
   enable:
     - gofmt

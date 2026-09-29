@@ -38,7 +38,7 @@ func serve() error {
 	redactor := redact.New(cfg.Secrets()...)
 	var out io.Writer = os.Stdout
 	if f, err := os.OpenFile(cfg.LogPath("supervisor"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		out = io.MultiWriter(os.Stdout, f)
 	}
 	logs.Setup(redactor.Writer(out))
@@ -69,7 +69,7 @@ func serve() error {
 	}
 	// Listen before anything slow, so /health answers within a second of the
 	// container starting instead of after the install.
-	ln, err := net.Listen("tcp", cfg.Listen)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}

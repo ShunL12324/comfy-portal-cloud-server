@@ -152,7 +152,7 @@ func (s *Supervisor) loop(ctx context.Context, p *proc) {
 
 			manual := false
 			select {
-			case err = <-done:
+			case <-done:
 			case <-p.restart:
 				manual = true
 				s.terminate(cmd, done)
@@ -194,7 +194,9 @@ func (s *Supervisor) spawn(spec Spec) (*exec.Cmd, *os.File, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
+	// Not CommandContext: that would SIGKILL on cancel. terminate() stops the
+	// process group gracefully instead.
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...) //nolint:noctx
 	cmd.Dir = spec.Dir
 	cmd.Env = append(os.Environ(), spec.Env...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile

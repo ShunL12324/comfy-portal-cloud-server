@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -80,7 +81,7 @@ func (m *Manager) Preflight(ctx context.Context, models []manifest.Model) (neede
 	}
 	slog.Info("disk check", "neededGiB", float64(needed)/(1<<30), "freeGiB", float64(free)/(1<<30))
 	if needed > 0 && uint64(needed) > free {
-		return needed, &DiskError{Needed: needed, Free: int64(free)}
+		return needed, &DiskError{Needed: needed, Free: int64(min(free, math.MaxInt64))}
 	}
 	return needed, nil
 }
@@ -357,7 +358,7 @@ func (m *Manager) headSize(ctx context.Context, raw string) int64 {
 	if err != nil {
 		return 0
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// HuggingFace reports an LFS object's real size here; Content-Length would
 	// be the pointer file's.
 	if v := resp.Header.Get("X-Linked-Size"); v != "" {
@@ -395,7 +396,7 @@ func (m *Manager) resolveCivitai(ctx context.Context, raw string) (string, error
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	switch resp.StatusCode {
 	case 301, 302, 303, 307, 308:
 		if loc := resp.Header.Get("Location"); loc != "" {
