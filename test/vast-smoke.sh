@@ -128,7 +128,7 @@ done
 [ -n "$SSHPORT" ] || { bad "no host could run the image after $ATTEMPTS attempts"; exit 1; }
 PULL_S=$(( $(date +%s) - T0 ))
 SSH_CMD="ssh -p $SSHPORT root@$IP"
-SSH=(ssh -p "$SSHPORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=15 -o LogLevel=ERROR "root@$IP")
+SSH=(env LC_ALL=C LANG=C ssh -p "$SSHPORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=15 -o LogLevel=ERROR "root@$IP")
 # vast installs sshd inside the container after it starts ("running" with ports
 # mapped can precede it by minutes on a slow host), so wait for it properly.
 SSH_WAIT=${SSH_WAIT:-600}
@@ -205,21 +205,27 @@ for p in "8189:$PUB8189" "8188:$PUB8188"; do
 done
 
 step "resilience"
+comfy_running_after() { [ "$(svc_field comfyui state)" = running ] && [ "$(svc_field comfyui restarts)" -ge "$1" ]; }
 PID=$(svc_field comfyui pid); "${SSH[@]}" "kill -9 $PID"
-wait_for "comfyui to restart after kill -9" 120 bash -c "$(declare -f api svc_field); SSH=(${SSH[*]@Q}); TOKEN=$TOKEN; [ \"\$(svc_field comfyui state)\" = running ] && [ \"\$(svc_field comfyui restarts)\" -ge 1 ]" && ok "kill -9 ComfyUI: supervisor brought it back" || true
+wait_for "comfyui to restart after kill -9" 120 comfy_running_after 1 && ok "kill -9 ComfyUI: supervisor brought it back" || true
 [ "$(apicode -X POST http://127.0.0.1:8189/v2/services/comfyui/restart)" = 202 ] && ok "API restart accepted" || bad "API restart"
 sleep 5
-wait_for "comfyui running after API restart" 120 bash -c "$(declare -f api svc_field); SSH=(${SSH[*]@Q}); TOKEN=$TOKEN; [ \"\$(svc_field comfyui state)\" = running ] && [ \"\$(svc_field comfyui restarts)\" -ge 2 ]" && ok "ComfyUI back after API restart" || true
+wait_for "comfyui running after API restart" 120 comfy_running_after 2 && ok "ComfyUI back after API restart" || true
 
 step "apply a manifest to the running box"
-BODY='{"extensions":["https://github.com/pythongosssss/ComfyUI-Custom-Scripts"],"models":[{"url":"https://huggingface.co/madebyollin/taesd/resolve/main/taesdxl_decoder.safetensors","folder":"vae_approx"}]}'
+model_done() { api http://127.0.0.1:8189/v2/models | jq -e --arg n "$1" '[.items[] | select(.name == $n and .state == "done")] | length == 1'; }
+BODY='{"extensions":["https://github.com/pythongosssss/ComfyUI-Custom-Scripts"],"models":[{"url":"https://huggingface.co/madebyollin/taesd/resolve/main/taesd_encoder.safetensors","folder":"vae_approx"}]}'
 [ "$(apicode -X PUT -H 'Content-Type:application/json' -d "'$BODY'" http://127.0.0.1:8189/v2/manifest)" = 202 ] && ok "PUT /v2/manifest accepted" || bad "PUT /v2/manifest"
-wait_for "new model" 120 bash -c "$(declare -f api); SSH=(${SSH[*]@Q}); TOKEN=$TOKEN; api http://127.0.0.1:8189/v2/models | jq -e '[.items[]|select(.name==\"taesdxl_decoder.safetensors\" and .state==\"done\")]|length==1'" && ok "model added without a relaunch" || true
+wait_for "the applied model to finish" 120 model_done taesd_encoder.safetensors && ok "model added without a relaunch" || {
+  echo "    models now:"; api http://127.0.0.1:8189/v2/models | jq -c '.items[] | {name, state, error, errorCode}' | sed 's/^/      /'
+  "${SSH[@]}" 'tail -15 /workspace/supervisor.log' | cut -c1-200 | sed 's/^/      /'; }
 
 step "graceful shutdown, then a relaunch resumes from disk"
-"${SSH[@]}" "pkill -TERM -f 'cpd serve'; sleep 1; for i in \$(seq 1 20); do pgrep -f 'cpd serve' >/dev/null || exit 0; sleep 1; done; exit 1" && ok "cpd exited on SIGTERM" || bad "cpd ignored SIGTERM"
-"${SSH[@]}" "pgrep -f 'venv/bin/python main.py' >/dev/null" && bad "ComfyUI outlived the supervisor" || ok "ComfyUI stopped with it"
-"${SSH[@]}" "pgrep aria2c >/dev/null" && bad "aria2c outlived the supervisor" || ok "aria2c stopped with it"
+# Match by exact process name, not -f: a -f pattern also matches the very shell
+# running this command, which is how an earlier version of this test killed itself.
+"${SSH[@]}" "pkill -TERM -x cpd; for i in \$(seq 1 25); do pgrep -x cpd >/dev/null || exit 0; sleep 1; done; exit 1" && ok "cpd exited on SIGTERM" || bad "cpd ignored SIGTERM"
+"${SSH[@]}" "pgrep -f '[v]env/bin/python main.py' >/dev/null" && bad "ComfyUI outlived the supervisor" || ok "ComfyUI stopped with it"
+"${SSH[@]}" "pgrep -x aria2c >/dev/null" && bad "aria2c outlived the supervisor" || ok "aria2c stopped with it"
 "${SSH[@]}" "export CP_TOKEN=$TOKEN CP_MANIFEST=$MANIFEST COMFY_PORT=8188 CP_PORT=8189; nohup /opt/comfyui/venv/bin/python /opt/cp/supervisor.py >> /workspace/supervisor-boot.log 2>&1 &"
 wait_for "ready after relaunch" 300 phase_is ready && ok "ready again after relaunch" || true
 "${SSH[@]}" "grep -c 'skip, already on disk' /workspace/supervisor.log" | { read -r n; [ "${n:-0}" -ge 1 ] && ok "relaunch skipped files already on disk" || bad "relaunch re-downloaded"; }
