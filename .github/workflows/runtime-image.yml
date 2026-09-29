@@ -15,7 +15,7 @@ env:
   REGISTRY: ghcr.io
   # Lowercased in the Tags step: GHCR rejects uppercase names and this owner
   # has capitals.
-  IMAGE_NAME: comfy-portal-runtime
+  IMAGE_NAME: comfy-portal-cloud-server
 
 jobs:
   # Fast gate: unit tests, then the real binary against real aria2c, a stub
@@ -137,7 +137,7 @@ jobs:
           {
             echo "### Runtime image"
             echo ''
-            echo 'Point `IMAGE_*` in src/features/cloud/services/provision.ts (comfy-portal repo) at:'
+            echo 'Point `IMAGE_*` in the app (comfy-portal repo, src/features/cloud/services/) at:'
             echo ''
             echo '```'
             echo "${{ steps.tags.outputs.primary }}"

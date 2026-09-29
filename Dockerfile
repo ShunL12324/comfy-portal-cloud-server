@@ -28,6 +28,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 FROM nvidia/cuda:${CUDA_TAG}
 
+# Links the GHCR package to this repo, so it inherits the repo's access and
+# visibility and this repo's workflow can publish it.
+LABEL org.opencontainers.image.source="https://github.com/ShunL12324/comfy-portal-cloud-server"
+
 # devel rather than runtime: custom nodes routinely build CUDA extensions on
 # install, and the few GB saved by runtime get paid back as compile failures on
 # a machine the user is paying for by the second.
