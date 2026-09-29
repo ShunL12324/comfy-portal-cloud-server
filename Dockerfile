@@ -85,6 +85,18 @@ RUN mkdir -p /opt/comfyui/custom_nodes && \
         [ -f "$req" ] && pip install -r "$req" || true; \
     done
 
+# No SSH host keys in the image: baked-in keys would be shared by every instance
+# that pulls it, and the private half would be public. But something has to make
+# them before sshd will accept a connection, and vast starts sshd from its own
+# entrypoint, which does not (its openssh-server install is a no-op because the
+# package is already here). So sshd itself generates them on first start, however
+# it is launched: vast, RunPod, or cpd.
+RUN mv /usr/sbin/sshd /usr/sbin/sshd.real && \
+    printf '%s\n' '#!/bin/sh' \
+        '[ -e /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1' \
+        'exec /usr/sbin/sshd.real "$@"' > /usr/sbin/sshd && \
+    chmod 755 /usr/sbin/sshd
+
 COPY --from=build /out/cpd /usr/local/bin/cpd
 # App builds that predate the Go supervisor launch /opt/cp/supervisor.py.
 COPY compat/supervisor.py /opt/cp/supervisor.py

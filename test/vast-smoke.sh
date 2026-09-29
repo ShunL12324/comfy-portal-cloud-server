@@ -20,10 +20,13 @@ MAX_PRICE=${MAX_PRICE:-0.15}
 LABEL="cp-smoke:$(date +%s)"
 TOKEN=$(uuidgen | tr 'A-Z' 'a-z')
 INSTANCE=""
+SSH_CMD="(not reachable yet)"
 FAILURES=0
 T0=$(date +%s)
 
-vast() { curl -fsS -H "Authorization: Bearer $VAST_API_KEY" -H 'Content-Type: application/json' "$@"; }
+# vast's responses can contain raw control characters (docker log tails in
+# status_msg) that make jq reject the whole document; strip them.
+vast() { curl -fsS --retry 4 --retry-all-errors --retry-delay 2 -H "Authorization: Bearer $VAST_API_KEY" -H 'Content-Type: application/json' "$@" | tr -d '\000-\037'; }
 step() { printf '\n== [%3ss] %s\n' "$(( $(date +%s) - T0 ))" "$*"; }
 ok()   { echo "  ok   $*"; }
 bad()  { echo "  FAIL $*"; FAILURES=$((FAILURES + 1)); }
@@ -49,22 +52,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# ---- offer ------------------------------------------------------------------
-step "pick an offer"
-if [ -z "${OFFER:-}" ]; then
-  OFFER=$(vast -X POST "$API/bundles/" -d "$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" '{
-      rentable:{eq:true}, type:"on-demand", num_gpus:{eq:1}, disk_space:{gte:($d+20)},
-      reliability2:{gte:0.98}, inet_down:{gte:500}, direct_port_count:{gte:4}, cuda_max_good:{gte:12.8},
-      gpu_name:{in:["RTX 3060","RTX 3070","RTX 3080","RTX 3090","RTX 4060","RTX 4070","RTX 4060 Ti","RTX 2060S"]},
-      dph_total:{lte:$p}, order:[["dph_total","asc"]], limit:5}')" |
-    jq -r '.offers[0] | "\(.id)"')
-fi
-[ -n "$OFFER" ] && [ "$OFFER" != null ] || { echo "no offer under \$$MAX_PRICE/hr"; exit 1; }
-vast -X POST "$API/bundles/" -d "$(jq -nc --argjson id "$OFFER" '{id:{eq:$id}, rentable:{eq:true}}')" |
-  jq -r '.offers[0] | "  offer \(.id): \(.gpu_name) \(.gpu_ram/1024|floor)GB  $\(.dph_total)/hr  \(.geolocation)  down \(.inet_down|floor) Mbps  driver \(.driver_version)"'
-
-# ---- launch, exactly like the app ------------------------------------------
-step "create the instance (this starts billing)"
+# ---- offer, launch and wait, retrying on a broken host ----------------------
 MANIFEST=$(jq -nc '{version:1,
   models:[
     {url:"https://huggingface.co/madebyollin/taesd/resolve/main/taesd_decoder.safetensors", folder:"vae_approx", filename:"taesd_decoder.safetensors"},
@@ -72,34 +60,87 @@ MANIFEST=$(jq -nc '{version:1,
   extensions:["https://github.com/pythongosssss/ComfyUI-Custom-Scripts"], ollamaModels:[]}' | base64 | tr -d '\n')
 ONSTART=$'mkdir -p /workspace\nnohup /opt/comfyui/venv/bin/python /opt/cp/supervisor.py >> /workspace/supervisor-boot.log 2>&1 &'
 ENVSTR="-e CP_TOKEN=$TOKEN -e CP_MANIFEST=$MANIFEST -e COMFY_PORT=8188 -e CP_PORT=8189 -p 8188:8188 -p 8189:8189"
-CREATED=$(vast -X PUT "$API/asks/$OFFER/" -d "$(jq -nc --arg image "$IMAGE" --argjson disk "$DISK" --arg label "$LABEL" \
-  --arg env "$ENVSTR" --arg onstart "$ONSTART" \
-  '{image:$image, disk:$disk, runtype:"ssh_direct", label:$label, env:$env, onstart:$onstart}')") || { echo "create failed"; exit 1; }
-INSTANCE=$(echo "$CREATED" | jq -r .new_contract)
-[ -n "$INSTANCE" ] && [ "$INSTANCE" != null ] || { echo "no instance id: $CREATED"; exit 1; }
-echo "  instance $INSTANCE (label $LABEL)"
+EXCLUDE="${EXCLUDE_MACHINES:-}"   # space-separated machine ids known to be bad
+ATTEMPTS=${ATTEMPTS:-4}
+# A daemon-level error in status_msg that persists this long means the host cannot
+# pull the image at all (seen: containerd "mkdir ... ingest" on a full store).
+HOST_BROKEN_AFTER=${HOST_BROKEN_AFTER:-240}
+# ...and a host that never reports loading/running at all (actual_status stays
+# null) has not even started creating the container.
+NO_START_AFTER=${NO_START_AFTER:-420}
 
-# ---- wait for the box -------------------------------------------------------
-step "wait for the container (image pull happens here)"
+destroy_instance() {
+  for _ in 1 2 3; do vast -X DELETE "$API/instances/$1/" >/dev/null 2>&1 && return 0; sleep 3; done
+}
+
 IP=""; SSHPORT=""; PUB8189=""; PUB8188=""
-for i in $(seq 1 180); do
-  J=$(vast "$API/instances/$INSTANCE/" 2>/dev/null | jq -c '.instances // empty' 2>/dev/null || true)
-  STATUS=$(echo "$J" | jq -r '.actual_status // "?"' 2>/dev/null)
-  if [ "$STATUS" = running ]; then
-    IP=$(echo "$J" | jq -r '.public_ipaddr'); SSHPORT=$(echo "$J" | jq -r '.ports["22/tcp"][0].HostPort // empty')
-    PUB8188=$(echo "$J" | jq -r '.ports["8188/tcp"][0].HostPort // empty'); PUB8189=$(echo "$J" | jq -r '.ports["8189/tcp"][0].HostPort // empty')
-    [ -n "$SSHPORT" ] && break
-  fi
-  [ $((i % 6)) = 0 ] && echo "  status=$STATUS  $(echo "$J" | jq -r '.status_msg // ""' | tr -d '\n' | cut -c1-110)"
-  case "$STATUS" in exited|offline) bad "instance entered $STATUS"; exit 1;; esac
-  sleep 10
+for attempt in $(seq 1 "$ATTEMPTS"); do
+  step "attempt $attempt/$ATTEMPTS: pick an offer"
+  OFFERS=$(vast -X POST "$API/bundles/" -d "$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" '{
+      rentable:{eq:true}, type:"on-demand", num_gpus:{eq:1}, disk_space:{gte:($d+20)},
+      reliability2:{gte:0.98}, inet_down:{gte:500}, direct_port_count:{gte:4}, cuda_max_good:{gte:12.8},
+      gpu_name:{in:["RTX 3060","RTX 3070","RTX 3080","RTX 3090","RTX 4060","RTX 4070","RTX 4060 Ti","RTX 2060S"]},
+      dph_total:{lte:$p}, order:[["dph_total","asc"]], limit:30}')")
+  PICK=$(echo "$OFFERS" | jq -c --arg pin "${OFFER:-}" --arg ex "$EXCLUDE" --arg cn "${ALLOW_CN:-0}" '
+      ($ex | split(" ") | map(select(length > 0))) as $bad
+      | [.offers[] | . as $o
+         | select(($bad | index($o.machine_id | tostring)) | not)
+         | select($cn == "1" or (($o.geolocation // "") | test(", CN$") | not))
+         | select($pin == "" or ($o.id | tostring) == $pin)] | .[0] // empty')
+  [ -n "$PICK" ] || { echo "no offer under \$$MAX_PRICE/hr (excluded machines: ${EXCLUDE:-none})"; exit 1; }
+  OFFER_ID=$(echo "$PICK" | jq -r .id); MACHINE=$(echo "$PICK" | jq -r .machine_id)
+  echo "$PICK" | jq -r '"  offer \(.id) machine \(.machine_id): \(.gpu_name) \((.gpu_ram/1024)|floor)GB  $\(.dph_total)/hr  \(.geolocation)  down \(.inet_down|floor) Mbps  driver \(.driver_version)"'
+
+  step "create the instance (this starts billing)"
+  CREATED=$(vast -X PUT "$API/asks/$OFFER_ID/" -d "$(jq -nc --arg image "$IMAGE" --argjson disk "$DISK" --arg label "$LABEL" \
+    --arg env "$ENVSTR" --arg onstart "$ONSTART" \
+    '{image:$image, disk:$disk, runtype:"ssh_direct", label:$label, env:$env, onstart:$onstart}')") \
+    || { echo "  create failed (offer gone?)"; EXCLUDE="$EXCLUDE $MACHINE"; OFFER=""; continue; }
+  INSTANCE=$(echo "$CREATED" | jq -r .new_contract)
+  [ -n "$INSTANCE" ] && [ "$INSTANCE" != null ] || { echo "no instance id: $CREATED"; exit 1; }
+  echo "  instance $INSTANCE (label $LABEL)"
+
+  step "wait for the container (image pull happens here)"
+  WAIT_START=$(date +%s); BAD_SINCE=""; HOST_BROKEN=""; SEEN_ACTIVE=""
+  for i in $(seq 1 180); do
+    J=$(vast "$API/instances/$INSTANCE/" 2>/dev/null | jq -c '.instances // empty' 2>/dev/null || true)
+    STATUS=$(echo "$J" | jq -r '.actual_status // "?"' 2>/dev/null)
+    MSG=$(echo "$J" | jq -r '.status_msg // ""' | tr -d '\n' | cut -c1-140)
+    if [ "$STATUS" = running ]; then
+      IP=$(echo "$J" | jq -r '.public_ipaddr'); SSHPORT=$(echo "$J" | jq -r '.ports["22/tcp"][0].HostPort // empty')
+      PUB8188=$(echo "$J" | jq -r '.ports["8188/tcp"][0].HostPort // empty'); PUB8189=$(echo "$J" | jq -r '.ports["8189/tcp"][0].HostPort // empty')
+      [ -n "$SSHPORT" ] && break
+    fi
+    [ $((i % 6)) = 0 ] && echo "  status=$STATUS  $MSG"
+    case "$MSG" in *"Error response from daemon"*)
+      BAD_SINCE=${BAD_SINCE:-$(date +%s)}
+      [ $(( $(date +%s) - BAD_SINCE )) -ge "$HOST_BROKEN_AFTER" ] && { HOST_BROKEN="$MSG"; break; };;
+    *) BAD_SINCE="";; esac
+    case "$STATUS" in loading|running) SEEN_ACTIVE=1;; esac
+    [ -z "$SEEN_ACTIVE" ] && [ $(( $(date +%s) - WAIT_START )) -ge "$NO_START_AFTER" ] && { HOST_BROKEN="never started (status=$STATUS)"; break; }
+    case "$STATUS" in exited|offline) HOST_BROKEN="instance entered $STATUS: $MSG"; break;; esac
+    sleep 10
+  done
+  [ -n "$SSHPORT" ] && break
+  echo "  host $MACHINE is broken: ${HOST_BROKEN:-never became reachable in 30 min}"
+  destroy_instance "$INSTANCE"; INSTANCE=""; EXCLUDE="$EXCLUDE $MACHINE"; OFFER=""
 done
-[ -n "$SSHPORT" ] || { bad "instance never became reachable in 30 min"; exit 1; }
+[ -n "$SSHPORT" ] || { bad "no host could run the image after $ATTEMPTS attempts"; exit 1; }
 PULL_S=$(( $(date +%s) - T0 ))
 SSH_CMD="ssh -p $SSHPORT root@$IP"
 SSH=(ssh -p "$SSHPORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=15 -o LogLevel=ERROR "root@$IP")
-for i in $(seq 1 30); do "${SSH[@]}" true 2>/dev/null && break; sleep 5; done
-"${SSH[@]}" true 2>/dev/null && ok "ssh works after ${PULL_S}s" || { bad "ssh never worked"; exit 1; }
+# vast installs sshd inside the container after it starts ("running" with ports
+# mapped can precede it by minutes on a slow host), so wait for it properly.
+SSH_WAIT=${SSH_WAIT:-600}
+for _ in $(seq 1 $((SSH_WAIT / 5))); do "${SSH[@]}" true 2>/dev/null && break; sleep 5; done
+if "${SSH[@]}" true 2>/dev/null; then
+  ok "ssh works after $(( $(date +%s) - T0 ))s (pull+start ${PULL_S}s)"
+else
+  bad "ssh never worked in ${SSH_WAIT}s"
+  ssh -v -p "$SSHPORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes "root@$IP" true 2>&1 | tail -12 | sed 's/^/    /'
+  vast "$API/instances/$INSTANCE/" | jq -r '.instances | "    vast: status=\(.actual_status) msg=\(.status_msg|tostring|.[0:300])"'
+  exit 1
+fi
 
 # The app's transport: curl on the loopback, over SSH.
 api() { "${SSH[@]}" "curl -fsS -m 10 -H 'Authorization: Bearer $TOKEN' $* "; }
@@ -178,5 +219,5 @@ wait_for "ready after relaunch" 300 phase_is ready && ok "ready again after rela
 # ---- verdict ----------------------------------------------------------------
 step "summary"
 echo "  image     $IMAGE"
-echo "  offer     $OFFER   pull+start ${PULL_S}s   total $(( $(date +%s) - T0 ))s"
+echo "  offer     $OFFER_ID   pull+start ${PULL_S}s   total $(( $(date +%s) - T0 ))s"
 if [ "$FAILURES" = 0 ]; then echo "  ALL CHECKS PASSED"; else echo "  $FAILURES CHECK(S) FAILED"; exit 1; fi
