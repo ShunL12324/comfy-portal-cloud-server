@@ -13,7 +13,24 @@
 # tested, not whatever master happened to be that morning.
 
 ARG CUDA_TAG=12.8.1-cudnn-devel-ubuntu22.04
+
+# The supervisor is one static Go binary, built in its own stage so the CUDA
+# image carries no toolchain and a code change never invalidates the torch layers.
+FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS build
+WORKDIR /src
+COPY go.mod ./
+COPY cmd ./cmd
+COPY internal ./internal
+ARG VERSION=dev
+# vast's GPU hosts are x86 only.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/cpd ./cmd/cpd
+
 FROM nvidia/cuda:${CUDA_TAG}
+
+# Links the GHCR package to this repo, so it inherits the repo's access and
+# visibility and this repo's workflow can publish it.
+LABEL org.opencontainers.image.source="https://github.com/ShunL12324/comfy-portal-cloud-server"
 
 # devel rather than runtime: custom nodes routinely build CUDA extensions on
 # install, and the few GB saved by runtime get paid back as compile failures on
@@ -35,7 +52,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
         python3 python3-venv python3-pip \
-        git curl ca-certificates aria2 openssh-server \
+        git curl ca-certificates aria2 openssh-server tini \
         libgl1 libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -68,11 +85,27 @@ RUN mkdir -p /opt/comfyui/custom_nodes && \
         [ -f "$req" ] && pip install -r "$req" || true; \
     done
 
-COPY supervisor.py /opt/cp/supervisor.py
+# No SSH host keys in the image: baked-in keys would be shared by every instance
+# that pulls it, and the private half would be public. But something has to make
+# them before sshd will accept a connection, and vast starts sshd from its own
+# entrypoint, which does not (its openssh-server install is a no-op because the
+# package is already here). So sshd itself generates them on first start, however
+# it is launched: vast, RunPod, or cpd.
+RUN mv /usr/sbin/sshd /usr/sbin/sshd.real && \
+    printf '%s\n' '#!/bin/sh' \
+        '[ -e /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1' \
+        'exec /usr/sbin/sshd.real "$@"' > /usr/sbin/sshd && \
+    chmod 755 /usr/sbin/sshd
+
+COPY --from=build /out/cpd /usr/local/bin/cpd
+# App builds that predate the Go supervisor launch /opt/cp/supervisor.py.
+COPY compat/supervisor.py /opt/cp/supervisor.py
 
 # Fail the build rather than the rental if the stack is broken.
 RUN python -c "import torch, sys; print('torch', torch.__version__)" && \
-    python -c "import ast, sys; ast.parse(open('/opt/cp/supervisor.py').read())"
+    cpd version
 
 EXPOSE 22 8188 8189
-ENTRYPOINT ["python", "/opt/cp/supervisor.py"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["cpd", "health"]
+# tini reaps the children ComfyUI and custom nodes orphan; cpd is not an init.
+ENTRYPOINT ["tini", "--", "cpd", "serve"]

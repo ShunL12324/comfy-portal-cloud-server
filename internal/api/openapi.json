@@ -1,0 +1,893 @@
+{
+ "openapi": "3.1.0",
+ "info": {
+  "title": "Comfy Portal cloud server",
+  "version": "3.0.0",
+  "description": "Runs inside a rented GPU. Every route except /health and /openapi.json needs `Authorization: Bearer $CP_TOKEN`. Errors are application/problem+json (RFC 9457). /v1 is a frozen compatibility layer."
+ },
+ "security": [
+  {
+   "bearer": []
+  }
+ ],
+ "paths": {
+  "/v2/health": {
+   "get": {
+    "summary": "Liveness (no auth)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "version": {
+           "type": "string"
+          },
+          "phase": {
+           "$ref": "#/components/schemas/Phase"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "security": []
+   }
+  },
+  "/v2/openapi.json": {
+   "get": {
+    "summary": "This document (no auth)",
+    "responses": {
+     "200": {
+      "description": "OpenAPI 3.1"
+     }
+    },
+    "security": []
+   }
+  },
+  "/v2/state": {
+   "get": {
+    "summary": "Phase, totals and error",
+    "responses": {
+     "200": {
+      "description": "State",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/State"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/snapshot": {
+   "get": {
+    "summary": "Everything in one response",
+    "responses": {
+     "200": {
+      "description": "Snapshot",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Snapshot"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/steps": {
+   "get": {
+    "summary": "Install steps",
+    "responses": {
+     "200": {
+      "description": "Steps",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "required": [
+          "items"
+         ],
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "$ref": "#/components/schemas/Step"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/models": {
+   "get": {
+    "summary": "Models",
+    "responses": {
+     "200": {
+      "description": "Models",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "required": [
+          "items"
+         ],
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "$ref": "#/components/schemas/Model"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/models/retry-failed": {
+   "post": {
+    "summary": "Retry every failed model",
+    "responses": {
+     "200": {
+      "description": "Retried IDs",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "retried": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/models/{id}": {
+   "get": {
+    "summary": "One model",
+    "responses": {
+     "200": {
+      "description": "Model",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Model"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Stable model ID from GET /v2/models."
+     }
+    ]
+   }
+  },
+  "/v2/models/{id}/retry": {
+   "post": {
+    "summary": "Retry one failed model",
+    "responses": {
+     "202": {
+      "description": "Re-queued",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Model"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Stable model ID from GET /v2/models."
+     }
+    ]
+   }
+  },
+  "/v2/services": {
+   "get": {
+    "summary": "Supervised services",
+    "responses": {
+     "200": {
+      "description": "Services",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "required": [
+          "items"
+         ],
+         "properties": {
+          "items": {
+           "type": "array",
+           "items": {
+            "$ref": "#/components/schemas/Service"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/services/{name}": {
+   "get": {
+    "summary": "One service",
+    "responses": {
+     "200": {
+      "description": "Service",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Service"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "name",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ]
+   }
+  },
+  "/v2/services/{name}/restart": {
+   "post": {
+    "summary": "Restart comfyui or ollama",
+    "responses": {
+     "202": {
+      "description": "Restarting",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Service"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "name",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ]
+   }
+  },
+  "/v2/manifest": {
+   "get": {
+    "summary": "Everything requested so far",
+    "responses": {
+     "200": {
+      "description": "Manifest",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Manifest"
+        }
+       }
+      }
+     }
+    }
+   },
+   "put": {
+    "summary": "Add models, extensions and Ollama models to a ready instance (additive, idempotent)",
+    "responses": {
+     "202": {
+      "description": "Accepted",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "accepted": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Manifest"
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v2/logs/{stream}": {
+   "get": {
+    "summary": "Redacted log tail",
+    "responses": {
+     "200": {
+      "description": "Plain text",
+      "content": {
+       "text/plain": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Problem",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "stream",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "enum": [
+        "supervisor",
+        "comfyui",
+        "ollama",
+        "aria2"
+       ]
+      }
+     },
+     {
+      "name": "tail",
+      "in": "query",
+      "schema": {
+       "type": "integer",
+       "minimum": 1,
+       "maximum": 5000,
+       "default": 200
+      }
+     }
+    ]
+   }
+  },
+  "/v2/events": {
+   "get": {
+    "summary": "Server-Sent Events",
+    "responses": {
+     "200": {
+      "description": "text/event-stream. First event is `snapshot` (full state) unless resuming with Last-Event-ID; then one typed event per change: phase.changed, step.updated, model.updated, service.updated, stalled.changed, restart-required.changed. `: ping` comments every 15s. If the stream ends, reconnect with Last-Event-ID.",
+      "content": {
+       "text/event-stream": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "Last-Event-ID",
+      "in": "header",
+      "schema": {
+       "type": "integer"
+      }
+     }
+    ]
+   }
+  },
+  "/v1/health": {
+   "get": {
+    "summary": "Legacy liveness",
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    },
+    "security": [],
+    "deprecated": true
+   }
+  },
+  "/v1/status": {
+   "get": {
+    "summary": "Legacy full snapshot",
+    "responses": {
+     "200": {
+      "description": "v1 snapshot (frozen shape)"
+     }
+    },
+    "deprecated": true
+   }
+  },
+  "/v1/log": {
+   "get": {
+    "summary": "Legacy log tail",
+    "responses": {
+     "200": {
+      "description": "text"
+     }
+    },
+    "deprecated": true
+   }
+  },
+  "/v1/events": {
+   "get": {
+    "summary": "Legacy SSE: full v1 snapshot every 2s",
+    "responses": {
+     "200": {
+      "description": "SSE"
+     }
+    },
+    "deprecated": true
+   }
+  },
+  "/v1/models/retry": {
+   "post": {
+    "summary": "Legacy retry by folder/name keys",
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    },
+    "deprecated": true
+   }
+  },
+  "/v1/comfyui/restart": {
+   "post": {
+    "summary": "Legacy ComfyUI restart",
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    },
+    "deprecated": true
+   }
+  }
+ },
+ "components": {
+  "securitySchemes": {
+   "bearer": {
+    "type": "http",
+    "scheme": "bearer"
+   }
+  },
+  "schemas": {
+   "Phase": {
+    "type": "string",
+    "enum": [
+     "preparing",
+     "downloading",
+     "starting",
+     "ready",
+     "failed"
+    ]
+   },
+   "Problem": {
+    "type": "object",
+    "required": [
+     "type",
+     "title",
+     "status",
+     "code"
+    ],
+    "properties": {
+     "type": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "status": {
+      "type": "integer"
+     },
+     "detail": {
+      "type": "string"
+     },
+     "code": {
+      "type": "string"
+     },
+     "hint": {
+      "type": "string"
+     }
+    }
+   },
+   "Failure": {
+    "type": "object",
+    "required": [
+     "code",
+     "message"
+    ],
+    "properties": {
+     "code": {
+      "type": "string"
+     },
+     "message": {
+      "type": "string"
+     },
+     "hint": {
+      "type": "string"
+     }
+    }
+   },
+   "Totals": {
+    "type": "object",
+    "properties": {
+     "bytes": {
+      "type": "integer"
+     },
+     "completed": {
+      "type": "integer"
+     },
+     "speed": {
+      "type": "integer"
+     },
+     "etaSeconds": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     }
+    }
+   },
+   "State": {
+    "type": "object",
+    "properties": {
+     "version": {
+      "type": "string"
+     },
+     "phase": {
+      "$ref": "#/components/schemas/Phase"
+     },
+     "startedAt": {
+      "type": "integer"
+     },
+     "elapsed": {
+      "type": "integer"
+     },
+     "stalled": {
+      "type": "boolean"
+     },
+     "lastProgressAt": {
+      "type": "integer"
+     },
+     "restartRequired": {
+      "type": "boolean"
+     },
+     "totals": {
+      "$ref": "#/components/schemas/Totals"
+     },
+     "error": {
+      "oneOf": [
+       {
+        "$ref": "#/components/schemas/Failure"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     }
+    }
+   },
+   "Step": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "state": {
+      "type": "string",
+      "enum": [
+       "running",
+       "done",
+       "failed"
+      ]
+     },
+     "detail": {
+      "type": "string"
+     },
+     "ms": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     }
+    }
+   },
+   "Model": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "name": {
+      "type": "string"
+     },
+     "folder": {
+      "type": "string"
+     },
+     "total": {
+      "type": "integer"
+     },
+     "completed": {
+      "type": "integer"
+     },
+     "speed": {
+      "type": "integer"
+     },
+     "state": {
+      "type": "string",
+      "enum": [
+       "waiting",
+       "active",
+       "done",
+       "error",
+       "paused",
+       "removed"
+      ]
+     },
+     "error": {
+      "type": "string"
+     },
+     "errorCode": {
+      "type": "string"
+     },
+     "hint": {
+      "type": "string"
+     }
+    }
+   },
+   "Service": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "state": {
+      "type": "string",
+      "enum": [
+       "starting",
+       "running",
+       "restarting",
+       "stopped"
+      ]
+     },
+     "pid": {
+      "type": "integer"
+     },
+     "restarts": {
+      "type": "integer"
+     },
+     "lastExit": {
+      "type": "integer"
+     },
+     "answeredAt": {
+      "type": "integer"
+     },
+     "models": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "Snapshot": {
+    "allOf": [
+     {
+      "$ref": "#/components/schemas/State"
+     },
+     {
+      "type": "object",
+      "properties": {
+       "steps": {
+        "type": "array",
+        "items": {
+         "$ref": "#/components/schemas/Step"
+        }
+       },
+       "models": {
+        "type": "array",
+        "items": {
+         "$ref": "#/components/schemas/Model"
+        }
+       },
+       "services": {
+        "type": "array",
+        "items": {
+         "$ref": "#/components/schemas/Service"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "Manifest": {
+    "type": "object",
+    "properties": {
+     "version": {
+      "type": "integer"
+     },
+     "models": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "required": [
+        "url"
+       ],
+       "properties": {
+        "url": {
+         "type": "string"
+        },
+        "folder": {
+         "type": "string"
+        },
+        "filename": {
+         "type": "string"
+        },
+        "sizeBytes": {
+         "type": "integer"
+        }
+       }
+      }
+     },
+     "extensions": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "ollamaModels": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  }
+ }
+}
