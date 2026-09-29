@@ -161,7 +161,12 @@ check "/v1/health answers (old app builds)" "${SSH[@]}" "curl -fs -m 5 http://12
 "${SSH[@]}" "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8189/v2/state" | grep -q 401 && ok "unauthenticated request is 401" || bad "unauthenticated request was not 401"
 
 step "boot to ready (real models, real extension, real ComfyUI on the GPU)"
-wait_for "ready" 900 phase_is ready
+# Fail fast: a launch that has already failed will not become ready by waiting.
+for _ in $(seq 1 300); do
+  PH=$(api http://127.0.0.1:8189/v2/state 2>/dev/null | jq -r .phase 2>/dev/null)
+  [ "$PH" = ready ] || [ "$PH" = failed ] && break
+  sleep 3
+done
 SNAP=$(api http://127.0.0.1:8189/v2/snapshot 2>/dev/null || echo '{}')
 echo "$SNAP" | jq -r '"  phase=\(.phase) elapsed=\(.elapsed)s  version=\(.version)"'
 echo "$SNAP" | jq -r '.steps[] | "  step \(.id) \(.state) \((.ms // 0)/1000)s"'

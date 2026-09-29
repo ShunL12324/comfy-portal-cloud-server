@@ -8,11 +8,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/manifest"
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/state"
@@ -59,7 +62,7 @@ func LinkIntoComfy(workspace, comfyDir string) error {
 				if _, err := os.Lstat(dst); err == nil {
 					continue
 				}
-				if err := os.Rename(filepath.Join(link, e.Name()), dst); err != nil {
+				if err := move(filepath.Join(link, e.Name()), dst); err != nil {
 					return err
 				}
 			}
@@ -74,6 +77,84 @@ func LinkIntoComfy(workspace, comfyDir string) error {
 		}
 	}
 	return nil
+}
+
+// renameFn is os.Rename; tests replace it to simulate a cross-device move.
+var renameFn = os.Rename
+
+// move renames src to dst, falling back to copy-then-delete when they are on
+// different filesystems. That is the normal case on vast: /workspace is a
+// separate mount from the image's layer, and rename(2) cannot cross it.
+//
+// The copy lands in dst+".partial" and is renamed into place only when
+// complete, so a crash part-way never leaves a half-populated dst that the
+// "already there, skip it" check would then trust.
+func move(src, dst string) error {
+	err := renameFn(src, dst)
+	if err == nil || !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	partial := dst + ".partial"
+	if err := os.RemoveAll(partial); err != nil {
+		return err
+	}
+	if err := copyTree(src, partial); err != nil {
+		_ = os.RemoveAll(partial)
+		return fmt.Errorf("copy %s: %w", src, err)
+	}
+	if err := os.Rename(partial, dst); err != nil {
+		return err
+	}
+	return os.RemoveAll(src)
+}
+
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(target, info.Mode().Perm())
+		case d.Type()&fs.ModeSymlink != 0:
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		case d.Type().IsRegular():
+			return copyFile(path, target, info.Mode().Perm())
+		}
+		return nil // sockets, devices: not part of a ComfyUI checkout
+	})
+}
+
+func copyFile(src, dst string, perm os.FileMode) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // Extensions clones each extension and installs its requirements. It stops at
