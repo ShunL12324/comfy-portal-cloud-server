@@ -10,6 +10,7 @@
 #   IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-abc1234 test/vast-bench.sh
 #   MACHINE=117918 IMAGE=... test/vast-bench.sh     # same host as a previous run, to compare
 #   MANIFEST_JSON=my.json IMAGE=... test/vast-bench.sh
+#   CUDA_MIN=13.0 IMAGE=...-cu130 test/vast-bench.sh   # a host whose driver runs CUDA 13
 #
 # Image pull time is only comparable between runs on the same host, and only
 # when neither image was already cached there.
@@ -56,9 +57,9 @@ MANIFEST=$(printf '%s' "$M" | base64 | tr -d '\n')
 ONSTART=$'mkdir -p /workspace\nnohup /opt/comfyui/venv/bin/python /opt/cp/supervisor.py >> /workspace/supervisor-boot.log 2>&1 &'
 ENVSTR="-e CP_TOKEN=$TOKEN -e CP_MANIFEST=$MANIFEST -e COMFY_PORT=8188 -e CP_PORT=8189 -p 8188:8188 -p 8189:8189"
 
-QUERY=$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" --arg m "${MACHINE:-}" '{
+QUERY=$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" --arg m "${MACHINE:-}" --argjson cuda "${CUDA_MIN:-12.8}" '{
   rentable:{eq:true}, type:"on-demand", num_gpus:{eq:1}, disk_space:{gte:($d+20)},
-  reliability2:{gte:0.98}, inet_down:{gte:500}, direct_port_count:{gte:4}, cuda_max_good:{gte:12.8},
+  reliability2:{gte:0.98}, inet_down:{gte:500}, direct_port_count:{gte:4}, cuda_max_good:{gte:$cuda},
   gpu_name:{in:["RTX 3060","RTX 3060 Ti","RTX 3070","RTX 3080","RTX 3090","RTX 4060","RTX 4060 Ti","RTX 4070","RTX 4070S","RTX 4080","RTX 4090","RTX 5060","RTX 5060 Ti","RTX 5070"]},
   dph_total:{lte:$p}, order:[["dph_total","asc"]], limit:30}
   + (if $m != "" then {machine_id:{eq:($m|tonumber)}} else {} end)')
@@ -110,6 +111,8 @@ echo; echo "== cpd report"
   { read -r first; case $first in '{'*) { echo "$first"; cat; } | jq -r '"total \(.elapsed)s phase=\(.phase)", (.steps[] | "step \((.ms // 0) / 1000)s \(.state) \(.id)")';; *) echo "$first"; cat;; esac; } | sed 's/^/  /'
 echo; echo "== ComfyUI's slowest custom node imports"
 "${SSH[@]}" "grep -oE '[0-9.]+ seconds: .*' /workspace/comfyui.log | sort -g -r | head -5" 2>/dev/null | sed 's/^/  /'
+echo; echo "== torch and CUDA, as ComfyUI saw them"
+"${SSH[@]}" "grep -E 'pytorch version|Device: |need pytorch with|backend cuda' /workspace/comfyui.log | cut -c1-140 | head -5" 2>/dev/null | sed 's/^/  /'
 echo
 echo "summary  image=$IMAGE"
 echo "summary  container running at ${RUNNING_AT}s, phase=$LASTP at ${READY_AT}s after the instance was created"
