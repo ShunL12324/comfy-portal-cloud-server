@@ -59,11 +59,13 @@ ENVSTR="-e CP_TOKEN=$TOKEN -e CP_MANIFEST=$MANIFEST -e COMFY_PORT=8188 -e CP_POR
 QUERY=$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" --arg m "${MACHINE:-}" '{
   rentable:{eq:true}, type:"on-demand", num_gpus:{eq:1}, disk_space:{gte:($d+20)},
   reliability2:{gte:0.98}, inet_down:{gte:500}, direct_port_count:{gte:4}, cuda_max_good:{gte:12.8},
+  gpu_name:{in:["RTX 3060","RTX 3060 Ti","RTX 3070","RTX 3080","RTX 3090","RTX 4060","RTX 4060 Ti","RTX 4070","RTX 4070S","RTX 4080","RTX 4090","RTX 5060","RTX 5060 Ti","RTX 5070"]},
   dph_total:{lte:$p}, order:[["dph_total","asc"]], limit:30}
   + (if $m != "" then {machine_id:{eq:($m|tonumber)}} else {} end)')
-PICK=$(vast -X POST "$API/bundles/" -d "$QUERY" | jq -c --arg ex "${EXCLUDE_MACHINES:-}" '
+PICK=$(vast -X POST "$API/bundles/" -d "$QUERY" | jq -c --arg ex "${EXCLUDE_MACHINES:-}" --arg cn "${ALLOW_CN:-0}" '
   ($ex | split(" ") | map(select(length > 0))) as $bad
-  | [.offers[] | . as $o | select(($bad | index($o.machine_id | tostring)) | not)] | .[0] // empty')
+  | [.offers[] | . as $o | select(($bad | index($o.machine_id | tostring)) | not)
+     | select($cn == "1" or (($o.geolocation // "") | test(", CN$") | not))] | .[0] // empty')
 [ -n "$PICK" ] || { echo "no offer under \$$MAX_PRICE/hr"; exit 1; }
 echo "$PICK" | jq -r '"offer \(.id) machine \(.machine_id): \(.gpu_name)  $\(.dph_total)/hr  \(.geolocation)  down \(.inet_down|floor) Mbps"'
 
@@ -103,7 +105,9 @@ done
 READY_AT=$(( $(date +%s) - T0 ))
 
 echo; echo "== cpd report"
-"${SSH[@]}" "CP_TOKEN=$TOKEN cpd report" | sed 's/^/  /'
+# Images from before `cpd report` existed: the steps are in the snapshot.
+"${SSH[@]}" "CP_TOKEN=$TOKEN cpd report 2>/dev/null || curl -fsS -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:8189/v2/snapshot" |
+  { read -r first; case $first in '{'*) { echo "$first"; cat; } | jq -r '"total \(.elapsed)s phase=\(.phase)", (.steps[] | "step \((.ms // 0) / 1000)s \(.state) \(.id)")';; *) echo "$first"; cat;; esac; } | sed 's/^/  /'
 echo; echo "== ComfyUI's slowest custom node imports"
 "${SSH[@]}" "grep -oE '[0-9.]+ seconds: .*' /workspace/comfyui.log | sort -g -r | head -5" 2>/dev/null | sed 's/^/  /'
 echo
