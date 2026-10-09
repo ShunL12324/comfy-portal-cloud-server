@@ -14,6 +14,65 @@ vast has no persistent volume, so installing at boot repeated all of it on every
 on an arbitrary host, with the GPU billing throughout. What stays at runtime is only what
 varies per launch: the template's models, extensions and Ollama models.
 
+## Setup speed
+
+A launch is: vast pulls the image, starts the container, and `cpd` installs the template
+(models, extensions, Ollama models) and starts ComfyUI. Measured on vast with three popular
+custom nodes (VideoHelperSuite, rgthree-comfy, KJNodes), the 6.9 GB SDXL base checkpoint
+from Hugging Face and a Civitai LoRA (`make vast-bench`), before (`sha-db9df15`) and after,
+each pair on one host:
+
+| | fast host (Norway, 8.8 Gbps) | typical host (Poland, 0.9 Gbps) |
+|---|---|---|
+| Image, compressed | 11.0 → 5.9 GB (largest layer 4.0 → 0.9 GB) | same |
+| Created → container running (pull + vast's start) | 263 → 156 s | 463 → 207 s |
+| `cpd` start → ready | 104 → 37 s | 185 → 77 s |
+| **Created → ready** | **382 → 194 s** | **654 → 283 s** |
+
+After the change, ComfyUI's own startup (21-32 s) and the extensions (4-10 s) finish while
+the model is still downloading, so `cpd`'s time is the download's: 6.9 GB at 210-340 MB/s
+on the fast host and ~100 MB/s on the typical one.
+
+Where the time went, and what changed:
+
+- **The image pull.** A vast host fetched one layer from GHCR at 30-40 MB/s however fast
+  its link (4.0 GB in 137 s), and docker fetches three layers at once. The image is now
+  built on `nvidia/cuda:*-base` with only nvcc, gcc and `python3-dev` added: the devel
+  image's 5 GB were static libraries, profilers and second copies of cuBLAS, cuDNN etc.,
+  which torch's wheels ship and load themselves. torch is installed from a lock over six
+  layers so none is much over a gigabyte. (The devel image also had no `Python.h`, so
+  nothing could build an extension anyway; now one compiles, which the build checks.)
+- **ComfyUI's startup.** The endpoint node installed Playwright's Chromium and ~290 apt
+  packages on every import: 65 s of every launch. They are in the image now; what is left
+  of its import (4-21 s) is the `apt-get update` its `playwright install-deps` still runs,
+  which only the endpoint node can skip. ComfyUI is
+  also started as soon as the extensions are in rather than after the models, since it
+  does not need them to start; the `comfyui-start` step covers only what is left to wait
+  for once the downloads finish (0 s when they take longer than ComfyUI's startup).
+- **Python installs.** [uv](https://github.com/astral-sh/uv) instead of pip, in the image
+  and at runtime. On the same host: torch 23 s vs 87-92 s, ComfyUI's requirements 8-12 s
+  vs 36-41 s, the three nodes' requirements 1.5 s (one uv call) vs 11-12 s (pip, one at a
+  time). micromamba from conda-forge took 51 s for torch and installs a different build
+  (CUDA 12.9, not the official cu128 wheel), so it lost on both counts.
+- **Extensions** are cloned in parallel and their requirements resolved in one uv call,
+  which also picks versions every extension accepts. They also get the link first: the
+  models wait for them (at most `CP_EXTENSIONS_FIRST_SECONDS`), because ComfyUI waits on
+  the extensions and not on the models. On the typical host, sharing the link with the
+  6.9 GB download had stretched the three extensions to 87 s; first, they take 10 s. torch, torchvision and torchaudio are
+  constrained to the image's builds (`/opt/comfyui/venv/constraints.txt`), so an extension
+  cannot replace the CUDA wheel with a PyPI one.
+- **Downloads** were already overlapped with everything else; aria2's settings stay. aria2
+  at 16 connections reached 220-380 MB/s from Hugging Face's CDN; other split sizes,
+  `falloc`, a larger disk cache, `geom` piece selection, `hf_xet` (226-471 MB/s) and
+  several files at once all fell inside the same run-to-run noise, and a single connection
+  managed 86 MB/s. Civitai's signed URL gave 150-170 MB/s with aria2 against 30-70 with curl.
+
+`cpd report` prints a launch's timings (each phase, each step with its start offset, each
+model with its average rate, ComfyUI's time to answer), and `cpd` logs the same lines when
+the launch settles. The same numbers are on `/v2`: `phases` on `/v2/state`, `startedAt` on
+steps, `startedAt`/`finishedAt`/`avgSpeed` on models and `readyMs` on services.
+`make vast-bench IMAGE=...` measures a whole launch on a rented GPU.
+
 ## Why a supervisor rather than a shell script
 
 A shell script can install, but it cannot be asked anything. `cpd` installs *and* serves
@@ -75,6 +134,7 @@ The subcommands exist so a remote shell can ask questions without hand-writing c
 
 ```sh
 cpd status [--json]        # phase, models, services (reads CP_TOKEN and CP_PORT)
+cpd report                 # how long each phase and step took, each model's average rate
 cpd logs comfyui -n 100
 cpd health                 # exit 0 if it answers; the image's HEALTHCHECK
 cpd version
@@ -90,6 +150,7 @@ cpd version
 | `CP_SSH_PUBLIC_KEY` | Optional. Starts a key-only sshd (RunPod; vast supplies its own) |
 | `COMFY_PORT`, `CP_PORT`, `CP_LISTEN` | Default 8188 / 8189 / `:8189` |
 | `CP_MAX_DOWNLOADS`, `CP_STALL_SECONDS` | Default 4 / 300 |
+| `CP_EXTENSIONS_FIRST_SECONDS` | Default 45. How long model downloads wait for the extensions to install, so ComfyUI's dependencies get the link first; `0` starts both at once |
 | `CP_WORKSPACE`, `COMFY_DIR` | Default `/workspace` / `/opt/comfyui` |
 
 The manifest is base64 because vast takes container env as one docker-flag string split on
@@ -146,8 +207,9 @@ test/rig/           the stub ComfyUI and fixture server
 make test     # go vet + go test -race
 make e2e      # needs aria2c, curl, jq; picks free ports, no network, no GPU
 make build    # bin/cpd
-make image    # the full CUDA image (amd64 host, ~20 GB)
+make image    # the full CUDA image (amd64 host, ~6 GB compressed)
 make vast-smoke IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-abc1234   # a few cents
+make vast-bench IMAGE=... [MACHINE=117918]   # time a realistic launch, a few cents
 ```
 
 `test/e2e.sh` covers the failures that have already happened: a model 404 must not stop the
@@ -174,9 +236,35 @@ It exists because two bugs were invisible to every other test:
   `custom_nodes` and `models` there with `rename(2)` failed with `EXDEV`. It now falls back to
   copy-then-delete, through a `.partial` directory so an interrupted copy is never trusted.
 
+`test/vast-bench.sh` launches the same way with a realistic template (three popular custom
+nodes, a 6.9 GB Hugging Face checkpoint, a Civitai LoRA) and prints the pull timeline from
+vast's status, each phase as it is reached, `cpd report` and ComfyUI's slowest imports. Pin
+`MACHINE` to compare two images on one host; pull times only compare when neither image was
+cached there.
+
 CI (`.github/workflows/runtime-image.yml`) runs gofmt, vet, `go test -race` (with the app's
 TypeScript client as a contract check), golangci-lint and the e2e before it builds and
 publishes the image.
+
+### Image build
+
+Python packages are installed with uv (`UV_COMPILE_BYTECODE=1`, pip's index behaviour via
+`UV_INDEX_STRATEGY=unsafe-best-match`, no cache left in the image). The venv still has pip.
+uv is also a module in the venv, so ComfyUI-Manager uses it (`use_uv = True`), and
+`/etc/uv/uv.toml` points a shell's `uv pip install` at the venv.
+
+Build arguments: `COMFYUI_REF`, `MANAGER_REF`, `ENDPOINT_REF`, `TORCH_VERSION`,
+`TORCHVISION_VERSION`, `TORCHAUDIO_VERSION`, `UV_VERSION`, and the CUDA flavour
+`CUDA_TAG` / `CUDA_APT` / `TORCH_CUDA` / `TORCH_INDEX` (cu128 by default).
+
+A manual run of the workflow takes two choices, both published only under a tag suffix
+(never `v1`):
+
+- `cuda: cu130` builds torch for CUDA 13 (`-cu130`), which ComfyUI's fast INT8/NVFP4
+  kernels need. It needs a host driver of 580 or newer (`cuda_max_good >= 13.0` on vast).
+- `compression: zstd` (`-zstd`) is 14% smaller and unpacks 2.5x faster, but needs Docker
+  23+ on the host, and on vast the pull is bound by GHCR's per-layer rate rather than
+  unpacking: it was no faster there, so gzip stays the default.
 
 ## Ollama
 
