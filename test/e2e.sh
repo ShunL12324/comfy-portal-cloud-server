@@ -121,6 +121,13 @@ OUT=$(CP_TOKEN=$TOKEN CP_PORT=$API_PORT "$CPD" status) || fail "cpd status"
 case $OUT in *phase=ready*) ;; *) fail "cpd status output: $OUT" ;; esac
 CP_TOKEN=$TOKEN CP_PORT=$API_PORT "$CPD" health || fail "cpd health"
 
+step "the launch is timed: per phase, per step, per model"
+REPORT=$(CP_TOKEN=$TOKEN CP_PORT=$API_PORT "$CPD" report) || fail "cpd report"
+echo "$REPORT" | sed 's/^/  /'
+case $REPORT in *"phase downloading"*"phase ready"*"step "*"comfyui"*) ;; *) fail "cpd report output" ;; esac
+api "$BASE/v2/state" | jq -e '[.phases[] | select(.phase=="downloading" and .ms != null)] | length == 1' >/dev/null || fail "phases not timed"
+grep -q 'report total' "$WORK/ws/supervisor.log" || fail "the supervisor log should carry the launch report"
+
 step "a restart resumes: complete files are skipped, not re-downloaded"
 kill -TERM "$CPD_PID"; wait "$CPD_PID" 2>/dev/null || true; CPD_PID=""
 ! curl -fs "$BASE/v2/health" >/dev/null 2>&1 || fail "port should be closed after shutdown"
