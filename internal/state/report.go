@@ -14,7 +14,11 @@ func (snap Snapshot) Report() []string {
 	var out []string
 	add := func(format string, args ...any) { out = append(out, fmt.Sprintf(format, args...)) }
 
-	add("total %s  phase=%s", seconds(snap.Elapsed*1000), snap.Phase)
+	total := snap.Elapsed * 1000
+	if n := len(snap.Phases); n > 1 && (snap.Phase == PhaseReady || snap.Phase == PhaseFailed) {
+		total = snap.Phases[n-1].StartedAt - snap.Phases[0].StartedAt // to ready, not to now
+	}
+	add("total %s  phase=%s", seconds(total), snap.Phase)
 	for _, p := range snap.Phases {
 		add("phase %-12s %s", p.Phase, msOrRunning(p.Ms))
 	}

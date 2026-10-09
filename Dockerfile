@@ -151,12 +151,15 @@ RUN mkdir -p /opt/comfyui/custom_nodes && \
         -r /opt/comfyui/custom_nodes/ComfyUI-Manager/requirements.txt \
         -r /opt/comfyui/custom_nodes/comfy-portal-endpoint/requirements.txt
 
-# The endpoint node makes sure Playwright's Chromium and its ~290 system
-# packages are installed every time it is imported. Measured on vast, that was
-# 65 s of every launch, inside ComfyUI's startup. Installed here, its check
-# finds everything present and returns in seconds.
+# The endpoint node makes sure Playwright's Chromium and its system packages
+# are installed every time it is imported. Measured on vast, that was 65 s of
+# every launch, inside ComfyUI's startup. Installed here, its check finds
+# everything present and returns in seconds. Its `install-deps` covers every
+# browser, not just Chromium, so this installs the same set: Chromium's alone
+# still left 227 packages and 36 s to every launch.
 RUN apt-get update -qq && \
-    python -m playwright install --with-deps chromium && \
+    python -m playwright install-deps && \
+    python -m playwright install chromium && \
     rm -rf /var/lib/apt/lists/*
 
 # No SSH host keys in the image: baked-in keys would be shared by every instance
@@ -170,6 +173,16 @@ RUN mv /usr/sbin/sshd /usr/sbin/sshd.real && \
         '[ -e /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1' \
         'exec /usr/sbin/sshd.real "$@"' > /usr/sbin/sshd && \
     chmod 755 /usr/sbin/sshd
+
+# The same uv settings for a shell on the box, where the image's ENV does not
+# reach (vast's sshd starts sessions without it): `uv pip install` there goes
+# into ComfyUI's venv, like it does for cpd and ComfyUI-Manager.
+RUN mkdir -p /etc/uv && printf '%s\n' \
+        'compile-bytecode = true' \
+        'index-strategy = "unsafe-best-match"' \
+        'python-downloads = "never"' \
+        '[pip]' \
+        'python = "/opt/comfyui/venv/bin/python"' > /etc/uv/uv.toml
 
 COPY --from=build /out/cpd /usr/local/bin/cpd
 # App builds that predate the Go supervisor launch /opt/cp/supervisor.py.
