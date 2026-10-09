@@ -20,6 +20,8 @@
 # byte that torch's wheels already ship (the CUDA libraries), and no layer much
 # over a gigabyte, so the three streams stay busy until the end.
 
+# The CUDA flavour: base image, the apt suffix of its nvcc, and torch's index.
+# cu130 needs a host driver of 580 or newer.
 ARG CUDA_TAG=12.8.1-base-ubuntu22.04
 ARG UV_VERSION=0.12.24
 
@@ -46,6 +48,8 @@ LABEL org.opencontainers.image.source="https://github.com/ShunL12324/comfy-porta
 ARG COMFYUI_REF=v0.34.0
 ARG MANAGER_REF=f39cbd56fecae0b27a446c0cd450cd591f3a8bea
 ARG ENDPOINT_REF=63dcd2678996634d082d5a7bbfee957cce087d6e
+ARG CUDA_APT=12-8
+ARG TORCH_CUDA=12.8
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ARG TORCH_VERSION=2.11.0
 ARG TORCHVISION_VERSION=0.26.0
@@ -76,7 +80,7 @@ ENV PATH=/opt/comfyui/venv/bin:$PATH
 # gcc, Python.h and nvcc stay. The rest of the devel image — 5 GB compressed of
 # static libraries, profilers and a second copy of cuBLAS, cuDNN and friends —
 # duplicates what torch's wheels already ship, and torch loads its own copies.
-# Headers for those libraries come from the same wheels (CPATH below).
+# Headers for those libraries come from the same wheels (linked in below).
 #
 # The second line is what vast's ssh_direct wrapper apt-installs into every
 # container on first start; already present, its install is a no-op.
@@ -85,7 +89,7 @@ RUN apt-get update -qq && \
         python3 python3-venv python3-dev build-essential \
         git curl ca-certificates aria2 openssh-server tini libgl1 libglib2.0-0 \
         tmux wget less locales sudo software-properties-common rsync \
-        cuda-nvcc-12-8 cuda-cudart-dev-12-8 && \
+        cuda-nvcc-${CUDA_APT} cuda-cudart-dev-${CUDA_APT} && \
     rm -rf /var/lib/apt/lists/*
 
 RUN rm -f /etc/ssh/ssh_host_*
@@ -99,27 +103,29 @@ RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
 # torch, pinned, and resolved once against the torch index into a lock; the
 # lock is then installed in several layers so no single layer is 4 GB. The
 # CUDA libraries go first, grouped by size; torch itself last.
+# cp-layer.sh installs the lock's lines that match a pattern, if there are any.
+RUN printf '%s\n' '#!/bin/sh' 'set -e' \
+        'grep -E "$1" /opt/comfyui/venv/torch.lock > /tmp/l || true' \
+        '[ -s /tmp/l ] && uv pip install --no-cache --no-deps --index-url "$TORCH_INDEX" -r /tmp/l' \
+        'rm -f /tmp/l' > /opt/cp-layer.sh && chmod 755 /opt/cp-layer.sh
 RUN printf 'torch==%s\ntorchvision==%s\ntorchaudio==%s\n' \
         "${TORCH_VERSION}" "${TORCHVISION_VERSION}" "${TORCHAUDIO_VERSION}" > /opt/comfyui/venv/constraints.txt && \
     uv pip compile --no-cache --quiet --no-header --no-annotate --index-url ${TORCH_INDEX} \
         /opt/comfyui/venv/constraints.txt -o /opt/comfyui/venv/torch.lock
-RUN grep -E '^nvidia-cudnn-' /opt/comfyui/venv/torch.lock > /tmp/l && \
-    uv pip install --no-cache --no-deps --index-url ${TORCH_INDEX} -r /tmp/l
-RUN grep -E '^nvidia-cublas-' /opt/comfyui/venv/torch.lock > /tmp/l && \
-    uv pip install --no-cache --no-deps --index-url ${TORCH_INDEX} -r /tmp/l
-RUN grep -E '^nvidia-(cusparselt|cusolver)-' /opt/comfyui/venv/torch.lock > /tmp/l && \
-    uv pip install --no-cache --no-deps --index-url ${TORCH_INDEX} -r /tmp/l
-RUN grep -E '^nvidia-(nccl|cusparse)-' /opt/comfyui/venv/torch.lock > /tmp/l && \
-    uv pip install --no-cache --no-deps --index-url ${TORCH_INDEX} -r /tmp/l
-RUN grep -E '^(nvidia-|triton=)' /opt/comfyui/venv/torch.lock > /tmp/l && \
-    uv pip install --no-cache --no-deps --index-url ${TORCH_INDEX} -r /tmp/l
-RUN uv pip install --no-cache --index-url ${TORCH_INDEX} -r /opt/comfyui/venv/torch.lock && \
-    rm /tmp/l
+RUN /opt/cp-layer.sh '^nvidia-cudnn'
+RUN /opt/cp-layer.sh '^nvidia-cublas'
+RUN /opt/cp-layer.sh '^nvidia-(cusparselt|cusolver)'
+RUN /opt/cp-layer.sh '^nvidia-(nccl|cusparse)'
+RUN /opt/cp-layer.sh '^(nvidia-|triton=)'
+RUN uv pip install --no-cache --index-url ${TORCH_INDEX} -r /opt/comfyui/venv/torch.lock
 
 # Headers for the CUDA libraries above, for extensions that compile against
-# torch: nvcc and gcc both read CPATH.
-ARG NV=/opt/comfyui/venv/lib/python3.10/site-packages/nvidia
-ENV CPATH=${NV}/cuda_runtime/include:${NV}/cublas/include:${NV}/cusparse/include:${NV}/cusolver/include:${NV}/curand/include:${NV}/cufft/include:${NV}/cudnn/include:${NV}/nvtx/include:${NV}/cusparselt/include:${NV}/nccl/include:${NV}/cuda_nvrtc/include
+# torch: symlinked into CUDA_HOME's include directory, which nvcc and torch's
+# cpp_extension already search, without overwriting cudart's own.
+RUN for d in /opt/comfyui/venv/lib/python3.10/site-packages/nvidia/*/include \
+             /opt/comfyui/venv/lib/python3.10/site-packages/nvidia/*/*/include; do \
+        [ -d "$d" ] && cp -rsn "$d/." /usr/local/cuda/include/; \
+    done; true
 
 # ComfyUI's frontend and workflow templates are mostly data and pinned in its
 # requirements; they get their own layer, and the rest of the requirements theirs.
@@ -172,7 +178,7 @@ COPY compat/supervisor.py /opt/cp/supervisor.py
 # Fail the build rather than the rental if the stack is broken: torch is the
 # pinned CUDA build, pip and uv both work in the venv, and an extension that
 # includes torch's CUDA headers compiles with what is here.
-RUN python -c "import torch, sys; print('torch', torch.__version__); assert torch.version.cuda == '12.8', torch.version.cuda" && \
+RUN python -c "import torch, sys; print('torch', torch.__version__); assert torch.version.cuda == '${TORCH_CUDA}', torch.version.cuda" && \
     pip --version && python -m uv --version && \
     TI=/opt/comfyui/venv/lib/python3.10/site-packages/torch/include && \
     printf '%s\n' '#include <torch/extension.h>' '#include <ATen/cuda/CUDAContext.h>' \
