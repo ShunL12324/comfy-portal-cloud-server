@@ -45,7 +45,7 @@ FROM nvidia/cuda:${CUDA_TAG}
 # visibility and this repo's workflow can publish it.
 LABEL org.opencontainers.image.source="https://github.com/ShunL12324/comfy-portal-cloud-server"
 
-ARG COMFYUI_REF=v0.34.0
+ARG COMFYUI_REF=v0.39.2
 ARG MANAGER_REF=f39cbd56fecae0b27a446c0cd450cd591f3a8bea
 ARG ENDPOINT_REF=63dcd2678996634d082d5a7bbfee957cce087d6e
 ARG CUDA_APT=12-8
