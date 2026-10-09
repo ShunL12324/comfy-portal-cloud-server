@@ -709,6 +709,12 @@
         "type": "null"
        }
       ]
+     },
+     "phases": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/PhaseTime"
+      }
      }
     }
    },
@@ -734,6 +740,10 @@
        "integer",
        "null"
       ]
+     },
+     "startedAt": {
+      "type": "integer",
+      "description": "Unix milliseconds."
      }
     }
    },
@@ -777,6 +787,18 @@
      },
      "hint": {
       "type": "string"
+     },
+     "startedAt": {
+      "type": "integer",
+      "description": "Unix milliseconds when the download went active."
+     },
+     "finishedAt": {
+      "type": "integer",
+      "description": "Unix milliseconds when it completed."
+     },
+     "avgSpeed": {
+      "type": "integer",
+      "description": "Bytes per second fetched between startedAt and finishedAt."
      }
     }
    },
@@ -812,6 +834,10 @@
       "items": {
        "type": "string"
       }
+     },
+     "readyMs": {
+      "type": "integer",
+      "description": "How long the last start took to answer its ready URL."
      }
     }
    },
@@ -885,6 +911,25 @@
       "items": {
        "type": "string"
       }
+     }
+    }
+   },
+   "PhaseTime": {
+    "type": "object",
+    "properties": {
+     "phase": {
+      "$ref": "#/components/schemas/Phase"
+     },
+     "startedAt": {
+      "type": "integer",
+      "description": "Unix milliseconds."
+     },
+     "ms": {
+      "type": [
+       "integer",
+       "null"
+      ],
+      "description": "Time spent in the phase; null while current."
      }
     }
    }

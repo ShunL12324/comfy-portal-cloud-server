@@ -58,8 +58,19 @@ type Step struct {
 	State  StepState `json:"state"`
 	Detail string    `json:"detail"`
 	// Ms is the wall time once the step settles; null while it runs.
-	Ms      *int64 `json:"ms"`
-	started time.Time
+	Ms *int64 `json:"ms"`
+	// StartedAt is unix milliseconds, so steps that overlap can be laid out
+	// on one timeline.
+	StartedAt int64 `json:"startedAt"`
+	started   time.Time
+}
+
+// PhaseTime is one phase the launch passed through.
+type PhaseTime struct {
+	Phase     Phase `json:"phase"`
+	StartedAt int64 `json:"startedAt"` // unix milliseconds
+	// Ms is the time spent in the phase; null while it is the current one.
+	Ms *int64 `json:"ms"`
 }
 
 type Model struct {
@@ -74,6 +85,16 @@ type Model struct {
 	Error     string     `json:"error,omitempty"`
 	ErrorCode string     `json:"errorCode,omitempty"`
 	Hint      string     `json:"hint,omitempty"`
+	// StartedAt and FinishedAt are unix milliseconds: when the download went
+	// active and when it completed. AvgSpeed is the bytes fetched in between
+	// over that time, so a resumed file is not credited with what was on disk.
+	StartedAt  int64 `json:"startedAt,omitempty"`
+	FinishedAt int64 `json:"finishedAt,omitempty"`
+	AvgSpeed   int64 `json:"avgSpeed,omitempty"`
+	// resumedFrom is Completed when the download went active; queuedAt is
+	// when it was handed to the engine, for files too small to be seen active.
+	resumedFrom int64
+	queuedAt    int64
 }
 
 type Service struct {
@@ -84,6 +105,8 @@ type Service struct {
 	LastExit   *int         `json:"lastExit,omitempty"`
 	AnsweredAt int64        `json:"answeredAt,omitempty"`
 	Models     []string     `json:"models,omitempty"`
+	// ReadyMs is how long the last start took to answer its ready URL.
+	ReadyMs *int64 `json:"readyMs,omitempty"`
 }
 
 type Problem struct {
@@ -109,6 +132,8 @@ type Summary struct {
 	RestartRequired bool     `json:"restartRequired"`
 	Totals          Totals   `json:"totals"`
 	Error           *Problem `json:"error"`
+	// Phases is every phase so far, oldest first.
+	Phases []PhaseTime `json:"phases"`
 }
 
 // Snapshot is the full state, persisted to disk after transitions.
@@ -127,6 +152,7 @@ type State struct {
 	redactor        *redact.Redactor
 	path            string
 	phase           Phase
+	phases          []PhaseTime
 	startedAt       time.Time
 	steps           []*Step
 	models          map[string]*Model
@@ -152,6 +178,7 @@ func New(path string, r *redact.Redactor) *State {
 	}
 	s.startedAt = s.now()
 	s.lastProgress = s.startedAt
+	s.phases = []PhaseTime{{Phase: PhasePreparing, StartedAt: s.startedAt.UnixMilli()}}
 	return s
 }
 
@@ -162,11 +189,12 @@ func (s *State) SetClock(now func() time.Time) {
 	s.now = now
 	s.startedAt = now()
 	s.lastProgress = s.startedAt
+	s.phases = []PhaseTime{{Phase: s.phase, StartedAt: s.startedAt.UnixMilli()}}
 }
 
 func (s *State) SetPhase(p Phase) {
 	s.mu.Lock()
-	s.phase = p
+	s.enterPhase(p)
 	s.publishPhase()
 	s.mu.Unlock()
 	slog.Info("phase", "phase", p)
@@ -176,12 +204,28 @@ func (s *State) SetPhase(p Phase) {
 // Fail records a fatal problem and moves to the failed phase.
 func (s *State) Fail(code, message, hint string) {
 	s.mu.Lock()
-	s.phase = PhaseFailed
+	s.enterPhase(PhaseFailed)
 	s.problem = &Problem{Code: code, Message: s.redactor.String(message), Hint: hint}
 	s.publishPhase()
 	s.mu.Unlock()
 	slog.Error("failed", "code", code, "message", message)
 	s.Persist()
+}
+
+// enterPhase closes the current phase's timing and opens p's.
+func (s *State) enterPhase(p Phase) {
+	now := s.now()
+	n := len(s.phases)
+	if n > 0 && s.phases[n-1].Phase == p && s.phases[n-1].Ms == nil {
+		s.phase = p
+		return // already in it
+	}
+	if n > 0 && s.phases[n-1].Ms == nil {
+		ms := now.UnixMilli() - s.phases[n-1].StartedAt
+		s.phases[n-1].Ms = &ms
+	}
+	s.phase = p
+	s.phases = append(s.phases, PhaseTime{Phase: p, StartedAt: now.UnixMilli()})
 }
 
 func (s *State) publishPhase() {
@@ -207,7 +251,8 @@ func (s *State) Step(id string, st StepState, detail string) {
 		}
 	}
 	if step == nil {
-		step = &Step{ID: id, started: s.now()}
+		now := s.now()
+		step = &Step{ID: id, started: now, StartedAt: now.UnixMilli()}
 		s.steps = append(s.steps, step)
 	}
 	step.State, step.Detail = st, detail
@@ -231,6 +276,9 @@ func (s *State) PutModel(m Model) {
 		s.modelOrder = append(s.modelOrder, m.ID)
 	}
 	cp := m
+	if cp.State == ModelWaiting {
+		cp.queuedAt = s.now().UnixMilli()
+	}
 	s.models[m.ID] = &cp
 	s.Hub.publish("model.updated", cp)
 }
@@ -247,10 +295,30 @@ func (s *State) UpdateModel(id string, fn func(*Model)) (Model, bool) {
 	}
 	before := *m
 	fn(m)
+	s.timeModel(before, m)
 	if *m != before {
 		s.Hub.publish("model.updated", *m)
 	}
 	return *m, true
+}
+
+// timeModel records when a download went active and finished, and its
+// average rate. Only the transitions count, so a stalled poll changes nothing.
+func (s *State) timeModel(before Model, m *Model) {
+	now := s.now()
+	if m.State == ModelActive && before.State != ModelActive && m.StartedAt == 0 {
+		m.StartedAt, m.resumedFrom = now.UnixMilli(), before.Completed
+	}
+	if m.State == ModelDone && before.State != ModelDone && m.StartedAt == 0 && m.queuedAt > 0 {
+		// Finished between two polls without ever being seen active.
+		m.StartedAt = m.queuedAt
+	}
+	if m.State == ModelDone && before.State != ModelDone && m.StartedAt > 0 {
+		m.FinishedAt = now.UnixMilli()
+		if ms := m.FinishedAt - m.StartedAt; ms > 0 {
+			m.AvgSpeed = (m.Completed - m.resumedFrom) * 1000 / ms
+		}
+	}
 }
 
 func (s *State) Model(id string) (Model, bool) {
@@ -381,6 +449,7 @@ func (s *State) summaryLocked() Summary {
 		RestartRequired: s.restartRequired,
 		Totals:          t,
 		Error:           s.problem,
+		Phases:          append([]PhaseTime(nil), s.phases...),
 	}
 }
 

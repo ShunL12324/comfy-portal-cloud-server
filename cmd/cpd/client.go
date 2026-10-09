@@ -93,6 +93,26 @@ func status(args []string) error {
 	return nil
 }
 
+// report prints the launch's timings: how long each phase and step took and
+// how fast each model came down.
+func report() error {
+	body, code, err := get("/v2/snapshot", 10*time.Second)
+	if err != nil {
+		return err
+	}
+	if code != http.StatusOK {
+		return fmt.Errorf("HTTP %d: %s", code, strings.TrimSpace(string(body)))
+	}
+	var snap state.Snapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		return err
+	}
+	for _, line := range snap.Report() {
+		fmt.Println(line)
+	}
+	return nil
+}
+
 func logsCmd(args []string) error {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	n := fs.Int("n", 200, "lines")

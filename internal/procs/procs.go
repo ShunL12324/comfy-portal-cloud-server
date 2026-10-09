@@ -147,7 +147,7 @@ func (s *Supervisor) loop(ctx context.Context, p *proc) {
 
 			probeCtx, stopProbe := context.WithCancel(ctx)
 			if p.spec.ReadyURL != "" {
-				go s.probe(probeCtx, p.spec)
+				go s.probe(probeCtx, p.spec, startedAt)
 			}
 
 			manual := false
@@ -224,7 +224,7 @@ func (s *Supervisor) terminate(cmd *exec.Cmd, done <-chan error) {
 // probe polls the ready URL until it answers, then marks the service running.
 // Custom nodes import at startup and some are slow, so this can take minutes;
 // the service stays "starting" meanwhile rather than claiming to be up.
-func (s *Supervisor) probe(ctx context.Context, spec Spec) {
+func (s *Supervisor) probe(ctx context.Context, spec Spec, startedAt time.Time) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, spec.ReadyURL, nil)
@@ -232,9 +232,11 @@ func (s *Supervisor) probe(ctx context.Context, spec Spec) {
 			ok := resp.StatusCode == http.StatusOK
 			_ = resp.Body.Close()
 			if ok {
+				took := time.Since(startedAt).Milliseconds()
 				s.st.UpdateService(spec.Name, func(v *state.Service) {
-					v.State, v.AnsweredAt = state.ServiceRunning, time.Now().Unix()
+					v.State, v.AnsweredAt, v.ReadyMs = state.ServiceRunning, time.Now().Unix(), &took
 				})
+				slog.Info("answering", "service", spec.Name, "afterMs", took)
 				return
 			}
 		}

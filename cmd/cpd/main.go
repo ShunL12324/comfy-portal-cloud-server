@@ -4,6 +4,7 @@
 //
 //	cpd serve            run the supervisor (default)
 //	cpd status [--json]  print the running supervisor's state
+//	cpd report           print the launch's per-phase timings and download rates
 //	cpd logs <stream>    print a log tail
 //	cpd health           exit 0 if the supervisor answers (for HEALTHCHECK)
 //	cpd version
@@ -29,6 +30,8 @@ func main() {
 		err = serve()
 	case "status":
 		err = status(args)
+	case "report":
+		err = report()
 	case "logs":
 		err = logsCmd(args)
 	case "health":
@@ -45,5 +48,5 @@ func main() {
 	}
 }
 
-const usage = `usage: cpd [serve | status [--json] | logs <stream> [-n N] | health | version]
+const usage = `usage: cpd [serve | status [--json] | report | logs <stream> [-n N] | health | version]
 `
