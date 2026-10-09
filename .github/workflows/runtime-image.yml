@@ -10,6 +10,15 @@ on:
   # Run it by hand on a branch to build (and publish under a sha- tag) the
   # image before merging.
   workflow_dispatch:
+    inputs:
+      compression:
+        description: >-
+          Layer compression. zstd pulls faster (measured on vast: 17% smaller,
+          unpacks 2.5x faster) but needs Docker 23+ on the host; it is
+          published under a -zstd tag suffix.
+        type: choice
+        options: [gzip, zstd]
+        default: gzip
 
 env:
   REGISTRY: ghcr.io
@@ -88,13 +97,17 @@ jobs:
           SHA=sha-$(git rev-parse --short HEAD)
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           BASE="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+          COMPRESSION="${{ inputs.compression || 'gzip' }}"
+          # A zstd build is an experiment until the app pins it: it never takes
+          # a stable tag, only sha-...-zstd.
+          SUFFIX=""; [ "$COMPRESSION" = zstd ] && SUFFIX=-zstd
           # Only main gets the stable tag an app build is allowed to point at.
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          if [ "${{ github.ref }}" = "refs/heads/main" ] && [ -z "$SUFFIX" ]; then
             echo "base=${BASE}:${SHA},${BASE}:v1" >> "$GITHUB_OUTPUT"
             echo "ollama=${BASE}:${SHA}-ollama,${BASE}:v1-ollama" >> "$GITHUB_OUTPUT"
           else
-            echo "base=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
-            echo "ollama=${BASE}:${SHA}-ollama" >> "$GITHUB_OUTPUT"
+            echo "base=${BASE}:${SHA}${SUFFIX}" >> "$GITHUB_OUTPUT"
+            echo "ollama=${BASE}:${SHA}${SUFFIX}-ollama" >> "$GITHUB_OUTPUT"
           fi
           # A v1.2.3 tag additionally publishes an immutable 1.2.3 image.
           case "${{ github.ref }}" in
@@ -104,9 +117,23 @@ jobs:
               echo "ollama=${BASE}:${SHA}-ollama,${BASE}:${V}-ollama,${BASE}:v1-ollama" >> "$GITHUB_OUTPUT"
               ;;
           esac
-          echo "primary=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "primary=${BASE}:${SHA}${SUFFIX}" >> "$GITHUB_OUTPUT"
           echo "version=${SHA}" >> "$GITHUB_OUTPUT"
+          # Branch builds read main's cache but write their own, so trying a
+          # branch never evicts the layers main's next build would reuse.
           echo "cacheref=${BASE}:buildcache" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref }}" = "refs/heads/main" ] || [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "cacheto=${BASE}:buildcache" >> "$GITHUB_OUTPUT"
+          else
+            echo "cacheto=${BASE}:buildcache-branch" >> "$GITHUB_OUTPUT"
+          fi
+          # OCI media types are required for zstd: docker cannot pull zstd
+          # layers labelled with the docker media type (docker/cli#5011).
+          if [ "$COMPRESSION" = zstd ]; then
+            echo "output=type=registry,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "output=type=registry" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push base
         uses: docker/build-push-action@v6
@@ -116,10 +143,12 @@ jobs:
           build-args: VERSION=${{ steps.tags.outputs.version }}
           # vast's GPU hosts are x86 only; an arm64 variant would never be pulled.
           platforms: linux/amd64
-          push: true
+          outputs: ${{ steps.tags.outputs.output }}
           tags: ${{ steps.tags.outputs.base }}
-          cache-from: type=registry,ref=${{ steps.tags.outputs.cacheref }}
-          cache-to: type=registry,ref=${{ steps.tags.outputs.cacheref }},mode=max
+          cache-from: |
+            type=registry,ref=${{ steps.tags.outputs.cacheref }}
+            type=registry,ref=${{ steps.tags.outputs.cacheref }}-branch
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cacheto }},mode=max
 
       - name: Build and push Ollama variant
         uses: docker/build-push-action@v6
@@ -127,7 +156,7 @@ jobs:
           context: .
           file: Dockerfile.ollama
           platforms: linux/amd64
-          push: true
+          outputs: ${{ steps.tags.outputs.output }}
           build-args: BASE=${{ steps.tags.outputs.primary }}
           tags: ${{ steps.tags.outputs.ollama }}
           cache-from: type=registry,ref=${{ steps.tags.outputs.cacheref }}
