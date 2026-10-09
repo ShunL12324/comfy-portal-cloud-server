@@ -1,4 +1,4 @@
-.PHONY: build test e2e lint image vast-smoke
+.PHONY: build test e2e lint image vast-smoke vast-bench
 
 VERSION ?= dev
 
@@ -23,3 +23,9 @@ image:
 vast-smoke:
 	@test -n "$(IMAGE)" || { echo "usage: make vast-smoke IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-..."; exit 1; }
 	IMAGE=$(IMAGE) test/vast-smoke.sh
+
+# Times a realistic launch of a published image on vast.ai and prints where
+# the time went (pull, phases, steps, download rates). Costs cents.
+vast-bench:
+	@test -n "$(IMAGE)" || { echo "usage: make vast-bench IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-... [MACHINE=id]"; exit 1; }
+	IMAGE=$(IMAGE) test/vast-bench.sh
