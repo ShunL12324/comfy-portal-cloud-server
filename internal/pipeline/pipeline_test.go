@@ -279,3 +279,49 @@ func TestComfyUIStartsWhileModelsDownload(t *testing.T) {
 		t.Fatalf("readyMs not recorded: %+v", svc)
 	}
 }
+
+func TestExtensionsGetTheLinkBeforeModels(t *testing.T) {
+	eng := &instantEngine{}
+	p, st, ctx := newPipeline(t, eng)
+	p.Cfg.ExtensionsFirst = time.Minute
+	var enginedDuringClone int
+	p.Run = func(_ context.Context, _ string, argv ...string) (string, error) {
+		if argv[0] == "git" {
+			eng.mu.Lock()
+			enginedDuringClone = eng.n
+			eng.mu.Unlock()
+			_ = os.MkdirAll(argv[len(argv)-1], 0o755)
+		}
+		return "", nil
+	}
+	bootWith(t, ctx, p, manifest.Manifest{
+		Extensions: []string{"https://github.com/u/A"},
+		Models:     []manifest.Model{{URL: "https://h.example/m.bin", SizeBytes: 100}},
+	})
+	if st.Phase() != state.PhaseReady {
+		t.Fatalf("phase = %s, error = %+v", st.Phase(), st.Summary().Error)
+	}
+	if enginedDuringClone != 0 {
+		t.Fatalf("%d model(s) were downloading while the extension cloned", enginedDuringClone)
+	}
+	if eng.n != 1 {
+		t.Fatalf("the model was never released: %d", eng.n)
+	}
+}
+
+func TestAFailedExtensionInstallStillReleasesTheModels(t *testing.T) {
+	eng := &instantEngine{}
+	p, st, ctx := newPipeline(t, eng)
+	p.Cfg.ExtensionsFirst = time.Minute
+	p.Run = func(context.Context, string, ...string) (string, error) { return "nope", fmt.Errorf("exit 1") }
+	bootWith(t, ctx, p, manifest.Manifest{
+		Extensions: []string{"https://github.com/u/broken"},
+		Models:     []manifest.Model{{URL: "https://h.example/m.bin", SizeBytes: 100}},
+	})
+	if st.Summary().Error == nil || st.Summary().Error.Code != "environment_install_failed" {
+		t.Fatalf("%+v", st.Summary().Error)
+	}
+	if eng.n != 1 {
+		t.Fatal("the model must still download when an extension fails")
+	}
+}

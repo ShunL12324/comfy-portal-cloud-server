@@ -103,8 +103,19 @@ func (p *Pipeline) Boot(ctx context.Context, m manifest.Manifest) {
 	// else is free if it overlaps. ComfyUI is spawned as soon as the extensions
 	// are in, because it imports them at startup; it does not need the models,
 	// and finds each one as it lands.
+	//
+	// The extensions do get the link to themselves first, for at most
+	// ExtensionsFirst: ComfyUI waits on them and not on the models, and they
+	// are a few hundred megabytes against gigabytes.
 	st.SetPhase(state.PhaseDownloading)
 	go p.DL.Run(ctx)
+	release := func() {}
+	if len(m.Extensions) > 0 && len(m.Models) > 0 && p.Cfg.ExtensionsFirst > 0 {
+		p.DL.Hold()
+		release = sync.OnceFunc(func() { p.DL.Release(ctx) })
+		timer := time.AfterFunc(p.Cfg.ExtensionsFirst, release)
+		defer timer.Stop()
+	}
 	p.DL.Queue(ctx, m.Models)
 
 	var spawnedAt time.Time
@@ -112,8 +123,10 @@ func (p *Pipeline) Boot(ctx context.Context, m manifest.Manifest) {
 	side := make(chan error, 1)
 	go func() {
 		_, err := p.installEnvironment(ctx, m, func() {
+			release()
 			spawnedAt, spawnErr = time.Now(), p.startComfy(ctx)
 		})
+		release() // a failed install must not keep the models waiting
 		side <- err
 	}()
 

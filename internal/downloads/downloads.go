@@ -48,6 +48,9 @@ type Manager struct {
 	mu      sync.Mutex
 	specs   map[string]manifest.Resolved // by model ID, so retry needs no manifest
 	pending map[string]string            // aria2 gid -> model ID
+	// held models are recorded as waiting but not yet handed to aria2; see Hold.
+	holding bool
+	held    []manifest.Resolved
 }
 
 func New(cfg Config, st *state.State, eng Engine, r *redact.Redactor) *Manager {
@@ -120,13 +123,45 @@ func (m *Manager) Queue(ctx context.Context, models []manifest.Model) {
 				continue
 			}
 		}
-		if err := m.add(ctx, r); err != nil {
-			m.st.PutModel(state.Model{
-				ID: r.ID, Name: r.Name, Folder: r.Folder, State: state.ModelError,
-				Error: m.redactor.String(err.Error()), ErrorCode: "queue_failed", Hint: "Retry, or check the URL.",
-			})
-			slog.Error("queue failed", "model", r.Key(), "err", err)
-		}
+		m.queue(ctx, r, m.add)
+	}
+}
+
+func (m *Manager) queue(ctx context.Context, r manifest.Resolved, add func(context.Context, manifest.Resolved) error) {
+	if err := add(ctx, r); err != nil {
+		m.st.PutModel(state.Model{
+			ID: r.ID, Name: r.Name, Folder: r.Folder, State: state.ModelError,
+			Error: m.redactor.String(err.Error()), ErrorCode: "queue_failed", Hint: "Retry, or check the URL.",
+		})
+		slog.Error("queue failed", "model", r.Key(), "err", err)
+	}
+}
+
+// Hold keeps models queued from now on out of aria2 until Release: they show
+// as waiting, but none of their bytes compete for the link.
+//
+// On a launch, the extensions gate ComfyUI's startup and the models do not, so
+// the extensions' few hundred megabytes should not share a saturated link with
+// gigabytes of models: measured on a 900 Mbps vast host, cloning three
+// extensions took 54 s next to a 6.9 GB download, and ComfyUI could only start
+// once both had finished.
+func (m *Manager) Hold() {
+	m.mu.Lock()
+	m.holding = true
+	m.mu.Unlock()
+}
+
+// Release hands every held model to aria2. Safe to call more than once.
+func (m *Manager) Release(ctx context.Context) {
+	m.mu.Lock()
+	held := m.held
+	m.holding, m.held = false, nil
+	m.mu.Unlock()
+	if len(held) > 0 {
+		slog.Info("releasing held downloads", "count", len(held))
+	}
+	for _, r := range held {
+		m.queue(ctx, r, m.start)
 	}
 }
 
@@ -158,6 +193,20 @@ func (m *Manager) add(ctx context.Context, r manifest.Resolved) error {
 		}
 	}
 
+	m.mu.Lock()
+	if m.holding {
+		m.held = append(m.held, r)
+		m.mu.Unlock()
+		m.st.PutModel(state.Model{ID: r.ID, Name: r.Name, Folder: r.Folder, Total: r.SizeBytes, State: state.ModelWaiting})
+		return nil
+	}
+	m.mu.Unlock()
+	return m.start(ctx, r)
+}
+
+// start hands one model to aria2.
+func (m *Manager) start(ctx context.Context, r manifest.Resolved) error {
+	dir := filepath.Join(m.cfg.Workspace, "models", filepath.FromSlash(r.Folder))
 	uri := r.URL
 	opts := aria2.Options{Dir: dir, Out: r.Name}
 	switch host := hostOf(uri); {
@@ -306,11 +355,11 @@ func (m *Manager) settle(gid string) {
 	m.mu.Unlock()
 }
 
-// Idle reports whether nothing is in flight.
+// Idle reports whether nothing is in flight or held.
 func (m *Manager) Idle() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.pending) == 0
+	return len(m.pending) == 0 && len(m.held) == 0
 }
 
 // Wait blocks until nothing is in flight and returns the IDs that failed.

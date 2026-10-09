@@ -218,3 +218,27 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+func TestHeldModelsWaitForRelease(t *testing.T) {
+	m, st, eng := setup(t, Config{})
+	m.Hold()
+	m.Queue(context.Background(), []manifest.Model{model("https://h.example/a.bin", "loras", "a.bin")})
+	if len(eng.added) != 0 {
+		t.Fatalf("held model reached the engine: %+v", eng.added)
+	}
+	if got := st.Models(); len(got) != 1 || got[0].State != state.ModelWaiting {
+		t.Fatalf("held model should show as waiting: %+v", got)
+	}
+	if m.Idle() {
+		t.Fatal("a held model is still work to do; Wait must not return")
+	}
+	m.Release(context.Background())
+	m.Release(context.Background()) // idempotent
+	if len(eng.added) != 1 {
+		t.Fatalf("release should hand it over exactly once: %+v", eng.added)
+	}
+	m.Queue(context.Background(), []manifest.Model{model("https://h.example/b.bin", "loras", "b.bin")})
+	if len(eng.added) != 2 {
+		t.Fatal("after release, models go straight to the engine")
+	}
+}

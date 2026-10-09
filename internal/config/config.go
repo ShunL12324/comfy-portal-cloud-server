@@ -36,7 +36,11 @@ type Config struct {
 	ComfyStartTimeout time.Duration
 	// How long extension and Ollama installation may take in total.
 	InstallTimeout time.Duration
-	PollInterval   time.Duration
+	// How long model downloads wait for the extensions to install first, so
+	// the extensions (which ComfyUI's startup waits on) get the whole link.
+	// Zero starts both at once.
+	ExtensionsFirst time.Duration
+	PollInterval    time.Duration
 
 	// AllowNoAuth lets the API run without CP_TOKEN. Only for local development:
 	// on a rented instance the port is on a public IP.
@@ -74,6 +78,13 @@ func FromEnv() (Config, error) {
 		return c, err
 	}
 	c.StallAfter = time.Duration(stall) * time.Second
+	first := 45
+	if v := get("CP_EXTENSIONS_FIRST_SECONDS"); v != "" {
+		if first, err = strconv.Atoi(v); err != nil || first < 0 {
+			return c, fmt.Errorf("CP_EXTENSIONS_FIRST_SECONDS must be a non-negative integer, got %q", v)
+		}
+	}
+	c.ExtensionsFirst = time.Duration(first) * time.Second
 	c.ComfyStartTimeout = 10 * time.Minute
 	c.InstallTimeout = 30 * time.Minute
 	c.PollInterval = 2 * time.Second
