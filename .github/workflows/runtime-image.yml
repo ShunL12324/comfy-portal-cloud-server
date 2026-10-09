@@ -19,6 +19,14 @@ on:
         type: choice
         options: [gzip, zstd]
         default: gzip
+      cuda:
+        description: >-
+          torch's CUDA build. cu130 enables ComfyUI's fast CUDA 13 kernels
+          but needs a host driver of 580 or newer; published under a -cu130
+          tag suffix.
+        type: choice
+        options: [cu128, cu130]
+        default: cu128
 
 env:
   REGISTRY: ghcr.io
@@ -98,9 +106,22 @@ jobs:
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           BASE="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
           COMPRESSION="${{ inputs.compression || 'gzip' }}"
-          # A zstd build is an experiment until the app pins it: it never takes
-          # a stable tag, only sha-...-zstd.
-          SUFFIX=""; [ "$COMPRESSION" = zstd ] && SUFFIX=-zstd
+          # A zstd or cu130 build is an experiment until the app pins it: it
+          # never takes a stable tag, only sha-...-cu130 / -zstd.
+          CUDA="${{ inputs.cuda || 'cu128' }}"
+          SUFFIX=""
+          if [ "$CUDA" = cu130 ]; then
+            SUFFIX=-cu130
+            {
+              echo 'cudaargs<<EOF'
+              echo 'CUDA_TAG=13.0.2-base-ubuntu22.04'
+              echo 'CUDA_APT=13-0'
+              echo 'TORCH_CUDA=13.0'
+              echo 'TORCH_INDEX=https://download.pytorch.org/whl/cu130'
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+          [ "$COMPRESSION" = zstd ] && SUFFIX=$SUFFIX-zstd
           # Only main gets the stable tag an app build is allowed to point at.
           if [ "${{ github.ref }}" = "refs/heads/main" ] && [ -z "$SUFFIX" ]; then
             echo "base=${BASE}:${SHA},${BASE}:v1" >> "$GITHUB_OUTPUT"
@@ -140,7 +161,9 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          build-args: VERSION=${{ steps.tags.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.tags.outputs.version }}
+            ${{ steps.tags.outputs.cudaargs }}
           # vast's GPU hosts are x86 only; an arm64 variant would never be pulled.
           platforms: linux/amd64
           outputs: ${{ steps.tags.outputs.output }}
