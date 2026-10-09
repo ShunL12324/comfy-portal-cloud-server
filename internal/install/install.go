@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/manifest"
@@ -159,44 +161,187 @@ func copyFile(src, dst string, perm os.FileMode) (err error) {
 	return err
 }
 
-// Extensions clones each extension and installs its requirements. It stops at
-// the first failure. Extensions already on disk are not re-cloned. It
-// reports whether anything new was installed, since ComfyUI must restart to
-// load it.
+// cloneParallel bounds concurrent clones: each is mostly waiting on GitHub,
+// but dozens at once would trip its rate limits.
+const cloneParallel = 8
+
+// Extensions clones the extensions that are not on disk yet, all at once, and
+// installs their requirements. It reports whether anything new was installed,
+// since ComfyUI must restart to load it.
+//
+// With uv in the venv (the image ships it) every requirements file goes to
+// one resolver call: one download pass instead of one per extension, and a set
+// of versions that satisfies all of them rather than whichever extension
+// happened to install last. Extensions already on disk are included, which
+// costs a resolve when nothing is missing and repairs one whose install was
+// interrupted. If the joint install fails, each extension is installed on its
+// own so the failure lands on the extension that caused it. Without uv it
+// falls back to pip, one extension at a time.
+//
+// A clone or install failure fails the call, but only after every other
+// extension has been installed, so no step is left running.
 func Extensions(ctx context.Context, st *state.State, run Runner, workspace, comfyDir string, urls []string) (installed bool, err error) {
 	root := filepath.Join(workspace, "custom_nodes")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return false, err
 	}
-	pip := filepath.Join(comfyDir, "venv", "bin", "pip")
+	if len(urls) == 0 {
+		return false, nil
+	}
+	st.Step("extensions", state.StepRunning, "")
+
+	type ext struct{ url, name, id, path string }
+	var fresh, present []ext
 	for _, url := range urls {
 		name := manifest.ExtensionName(url)
-		id := "extension:" + url
-		path := filepath.Join(root, name)
-		if _, err := os.Stat(path); err == nil {
-			st.Step(id, state.StepDone, name)
+		e := ext{url, name, "extension:" + url, filepath.Join(root, name)}
+		if _, err := os.Stat(e.path); err == nil {
+			st.Step(e.id, state.StepDone, name)
+			present = append(present, e)
 			continue
 		}
-		st.Step(id, state.StepRunning, name)
-		if out, err := run(ctx, "", "git", "clone", "--depth", "1", "--", url, path); err != nil {
-			_ = os.RemoveAll(path) // a half-clone would be skipped next time
-			st.Step(id, state.StepFailed, tail(out))
-			return installed, fmt.Errorf("could not clone extension %s", name)
+		fresh = append(fresh, e)
+	}
+
+	failed := map[string]error{} // by id
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, cloneParallel)
+	for _, e := range fresh {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			st.Step(e.id, state.StepRunning, e.name)
+			out, err := run(ctx, "", "git", "clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules", "--", e.url, e.path)
+			if err != nil {
+				_ = os.RemoveAll(e.path) // a half-clone would be skipped next time
+				st.Step(e.id, state.StepFailed, tail(out))
+				mu.Lock()
+				failed[e.id] = fmt.Errorf("could not clone extension %s", e.name)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Requirements of everything that is on disk now.
+	py := NewPython(comfyDir)
+	var reqs []ext
+	for _, e := range append(present, fresh...) {
+		if failed[e.id] != nil || (!py.UV && slices.Contains(present, e)) {
+			continue // pip only installs what it just cloned, as it always has
 		}
-		req := filepath.Join(path, "requirements.txt")
-		if _, err := os.Stat(req); err == nil {
-			if _, perr := os.Stat(pip); perr == nil {
-				if out, err := run(ctx, "", pip, "install", "-q", "-r", req); err != nil {
-					st.Step(id, state.StepFailed, tail(out))
-					return installed, fmt.Errorf("could not install dependencies for %s", name)
+		if _, err := os.Stat(filepath.Join(e.path, "requirements.txt")); err == nil {
+			reqs = append(reqs, e)
+		}
+	}
+	if len(reqs) > 0 && py.Available() {
+		files := make([]string, len(reqs))
+		for i, e := range reqs {
+			files[i] = filepath.Join(e.path, "requirements.txt")
+		}
+		st.Step("extensions:requirements", state.StepRunning, py.Tool())
+		joint := py.UV && len(files) > 1
+		if joint {
+			if _, err := run(ctx, "", py.InstallArgv(files...)...); err != nil {
+				joint = false // find out which one
+			}
+		}
+		if !joint {
+			for i, e := range reqs {
+				if out, err := run(ctx, "", py.InstallArgv(files[i])...); err != nil {
+					if slices.Contains(fresh, e) || py.UV {
+						st.Step(e.id, state.StepFailed, tail(out))
+					}
+					failed[e.id] = fmt.Errorf("could not install dependencies for %s", e.name)
 				}
 			}
 		}
-		installed = true
-		st.Step(id, state.StepDone, name)
-		slog.Info("installed extension", "name", name)
+		if len(failed) > 0 {
+			st.Step("extensions:requirements", state.StepFailed, py.Tool())
+		} else {
+			st.Step("extensions:requirements", state.StepDone, fmt.Sprintf("%s, %d extensions", py.Tool(), len(files)))
+		}
 	}
+
+	for _, e := range fresh {
+		if failed[e.id] == nil {
+			installed = true
+			st.Step(e.id, state.StepDone, e.name)
+			slog.Info("installed extension", "name", e.name)
+		}
+	}
+	for _, url := range urls { // report the first failure in manifest order
+		if err := failed["extension:"+url]; err != nil {
+			st.Step("extensions", state.StepFailed, err.Error())
+			return installed, err
+		}
+	}
+	st.Step("extensions", state.StepDone, fmt.Sprintf("%d cloned, %d already present", len(fresh), len(present)))
 	return installed, nil
+}
+
+// Python installs packages into ComfyUI's venv, with uv when the venv has it
+// and pip otherwise.
+type Python struct {
+	Venv string
+	UV   bool
+	// Constraints pins what an extension may not change (torch and its
+	// companions, which the image built for its CUDA version). Optional.
+	Constraints string
+}
+
+func NewPython(comfyDir string) Python {
+	venv := filepath.Join(comfyDir, "venv")
+	p := Python{Venv: venv}
+	if _, err := os.Stat(filepath.Join(venv, "bin", "uv")); err == nil {
+		p.UV = true
+	}
+	if _, err := os.Stat(filepath.Join(venv, "constraints.txt")); err == nil {
+		p.Constraints = filepath.Join(venv, "constraints.txt")
+	}
+	return p
+}
+
+// Available reports whether there is anything to install with.
+func (p Python) Available() bool {
+	if p.UV {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(p.Venv, "bin", "pip"))
+	return err == nil
+}
+
+func (p Python) Tool() string {
+	if p.UV {
+		return "uv"
+	}
+	return "pip"
+}
+
+// InstallArgv is the command that installs the given requirements files.
+func (p Python) InstallArgv(requirements ...string) []string {
+	var argv []string
+	if p.UV {
+		// unsafe-best-match is pip's behaviour: an extension that adds an
+		// --extra-index-url gets the best version across indexes, not the
+		// first index's. Bytecode is compiled now, on every core, rather than
+		// one module at a time while ComfyUI imports it.
+		argv = []string{filepath.Join(p.Venv, "bin", "uv"), "pip", "install", "--quiet",
+			"--python", filepath.Join(p.Venv, "bin", "python"),
+			"--index-strategy", "unsafe-best-match", "--compile-bytecode"}
+	} else {
+		argv = []string{filepath.Join(p.Venv, "bin", "pip"), "install", "-q"}
+	}
+	if p.Constraints != "" {
+		argv = append(argv, "-c", p.Constraints)
+	}
+	for _, r := range requirements {
+		argv = append(argv, "-r", r)
+	}
+	return argv
 }
 
 // PullOllama pulls each model through a running ollama server.

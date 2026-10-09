@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/redact"
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/state"
@@ -77,8 +79,127 @@ func TestFailedCloneLeavesNothingBehind(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(ws, "custom_nodes", "gone")); statErr == nil {
 		t.Fatal("half-clone left on disk")
 	}
-	if s := st.Steps()[0]; s.State != state.StepFailed || !strings.Contains(s.Detail, "not found") {
+	if s := step(st, "extension:https://github.com/u/gone"); s.State != state.StepFailed || !strings.Contains(s.Detail, "not found") {
 		t.Fatalf("%+v", s)
+	}
+	if s := step(st, "extensions"); s.State != state.StepFailed {
+		t.Fatalf("aggregate step must fail too: %+v", s)
+	}
+}
+
+func step(st *state.State, id string) state.Step {
+	for _, s := range st.Steps() {
+		if s.ID == id {
+			return s
+		}
+	}
+	return state.Step{}
+}
+
+// uvVenv makes comfy look like the image: a venv with uv and a constraints file.
+func uvVenv(t *testing.T) string {
+	t.Helper()
+	comfy := t.TempDir()
+	bin := filepath.Join(comfy, "venv", "bin")
+	_ = os.MkdirAll(bin, 0o755)
+	_ = os.WriteFile(filepath.Join(bin, "uv"), nil, 0o755)
+	_ = os.WriteFile(filepath.Join(comfy, "venv", "constraints.txt"), []byte("torch==2.11.0\n"), 0o644)
+	return comfy
+}
+
+// fakeGit clones by creating the directory with a requirements file.
+type fakeRun struct {
+	mu             sync.Mutex
+	clones         int
+	inflight, peak int
+	installs       [][]string
+	failReq        string // an install whose argv mentions this fails
+}
+
+func (f *fakeRun) run(_ context.Context, _ string, argv ...string) (string, error) {
+	if argv[0] == "git" {
+		f.mu.Lock()
+		f.clones++
+		f.inflight++
+		f.peak = max(f.peak, f.inflight)
+		f.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		dest := argv[len(argv)-1]
+		_ = os.MkdirAll(dest, 0o755)
+		_ = os.WriteFile(filepath.Join(dest, "requirements.txt"), []byte("x"), 0o644)
+		f.mu.Lock()
+		f.inflight--
+		f.mu.Unlock()
+		return "", nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.installs = append(f.installs, argv)
+	if f.failReq != "" && strings.Contains(strings.Join(argv, " "), f.failReq) {
+		return "No solution found: " + f.failReq, errors.New("exit 1")
+	}
+	return "", nil
+}
+
+func TestExtensionsCloneInParallelAndInstallInOneUVCall(t *testing.T) {
+	ws, comfy := t.TempDir(), uvVenv(t)
+	st := state.New("", redact.New())
+	f := &fakeRun{}
+	urls := []string{"https://github.com/u/A", "https://github.com/u/B", "https://github.com/u/C"}
+	installed, err := Extensions(context.Background(), st, f.run, ws, comfy, urls)
+	if err != nil || !installed {
+		t.Fatalf("installed=%v err=%v", installed, err)
+	}
+	if f.clones != 3 || f.peak < 2 {
+		t.Fatalf("clones=%d peak concurrency=%d, want parallel clones", f.clones, f.peak)
+	}
+	if len(f.installs) != 1 {
+		t.Fatalf("want one resolver call, got %d: %v", len(f.installs), f.installs)
+	}
+	argv := strings.Join(f.installs[0], " ")
+	for _, want := range []string{"venv/bin/uv pip install", "--index-strategy unsafe-best-match", "--compile-bytecode",
+		"-c " + filepath.Join(comfy, "venv", "constraints.txt"), "A/requirements.txt", "B/requirements.txt", "C/requirements.txt"} {
+		if !strings.Contains(argv, want) {
+			t.Errorf("install argv lacks %q: %s", want, argv)
+		}
+	}
+	for _, u := range urls {
+		if s := step(st, "extension:"+u); s.State != state.StepDone {
+			t.Errorf("%s: %+v", u, s)
+		}
+	}
+	if s := step(st, "extensions:requirements"); s.State != state.StepDone || !strings.Contains(s.Detail, "uv") {
+		t.Errorf("%+v", s)
+	}
+
+	// Already on disk: nothing is cloned again, but uv re-checks the
+	// requirements, which repairs an interrupted install.
+	installed, err = Extensions(context.Background(), st, f.run, ws, comfy, urls)
+	if err != nil || installed || f.clones != 3 || len(f.installs) != 2 {
+		t.Fatalf("second pass: installed=%v err=%v clones=%d installs=%d", installed, err, f.clones, len(f.installs))
+	}
+}
+
+func TestJointInstallFailureIsPinnedOnTheExtensionThatCausedIt(t *testing.T) {
+	ws, comfy := t.TempDir(), uvVenv(t)
+	st := state.New("", redact.New())
+	f := &fakeRun{failReq: "/B/requirements.txt"}
+	urls := []string{"https://github.com/u/A", "https://github.com/u/B", "https://github.com/u/C"}
+	_, err := Extensions(context.Background(), st, f.run, ws, comfy, urls)
+	if err == nil || !strings.Contains(err.Error(), "B") {
+		t.Fatalf("err = %v", err)
+	}
+	// One joint attempt, then one per extension.
+	if len(f.installs) != 4 {
+		t.Fatalf("installs = %d", len(f.installs))
+	}
+	if s := step(st, "extension:https://github.com/u/B"); s.State != state.StepFailed || !strings.Contains(s.Detail, "No solution") {
+		t.Fatalf("B: %+v", s)
+	}
+	for _, u := range []string{"https://github.com/u/A", "https://github.com/u/C"} {
+		if s := step(st, "extension:"+u); s.State != state.StepDone {
+			t.Fatalf("%s must still install: %+v", u, s)
+		}
 	}
 }
 
