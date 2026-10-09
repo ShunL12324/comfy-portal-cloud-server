@@ -217,3 +217,65 @@ func TestMerge(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+// gatedEngine keeps every download active until release is closed.
+type gatedEngine struct {
+	instantEngine
+	release chan struct{}
+}
+
+func (e *gatedEngine) TellStatus(ctx context.Context, gid string) (aria2.Status, error) {
+	select {
+	case <-e.release:
+		return e.instantEngine.TellStatus(ctx, gid)
+	default:
+		return aria2.Status{State: "active", Completed: 10, Total: 100, Speed: 5}, nil
+	}
+}
+
+func TestComfyUIStartsWhileModelsDownload(t *testing.T) {
+	eng := &gatedEngine{release: make(chan struct{})}
+	p, st, ctx := newPipeline(t, &eng.instantEngine)
+	p.DL = downloads.New(downloads.Config{
+		Workspace: p.Cfg.Workspace, PollInterval: 10 * time.Millisecond, StallAfter: time.Minute,
+		FreeBytes: func(string) (uint64, error) { return 1 << 40, nil },
+	}, st, eng, redact.New())
+	done := make(chan struct{})
+	go func() {
+		p.Boot(ctx, manifest.Manifest{Models: []manifest.Model{{URL: "https://h.example/big.bin", SizeBytes: 100}}})
+		close(done)
+	}()
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		svc, _ := st.Service("comfyui")
+		if svc.State == state.ServiceRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ComfyUI never came up while downloading: %+v", svc)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if st.Phase() != state.PhaseDownloading {
+		t.Fatalf("phase = %s, want downloading while the model is still active", st.Phase())
+	}
+	for _, s := range st.Steps() {
+		if s.ID == "comfyui-start" {
+			t.Fatal("comfyui-start must not show while models are still the thing being waited on")
+		}
+	}
+
+	close(eng.release)
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("boot did not finish")
+	}
+	if st.Phase() != state.PhaseReady {
+		t.Fatalf("phase = %s, error = %+v", st.Phase(), st.Summary().Error)
+	}
+	if svc, _ := st.Service("comfyui"); svc.ReadyMs == nil {
+		t.Fatalf("readyMs not recorded: %+v", svc)
+	}
+}

@@ -59,6 +59,7 @@ func (p *Pipeline) Boot(ctx context.Context, m manifest.Manifest) {
 	p.mu.Lock()
 	p.current = m
 	p.mu.Unlock()
+	defer p.logReport()
 
 	st := p.St
 	st.SetPhase(state.PhasePreparing)
@@ -97,15 +98,22 @@ func (p *Pipeline) Boot(ctx context.Context, m manifest.Manifest) {
 	}
 	st.Step("aria2", state.StepDone, "")
 
-	// Extensions and Ollama proceed while models download: on a fresh instance
-	// the models are the clock, and everything else is free if it overlaps.
+	// Extensions, Ollama and ComfyUI's own startup all proceed while models
+	// download: on a fresh instance the models are the clock, and everything
+	// else is free if it overlaps. ComfyUI is spawned as soon as the extensions
+	// are in, because it imports them at startup; it does not need the models,
+	// and finds each one as it lands.
 	st.SetPhase(state.PhaseDownloading)
 	go p.DL.Run(ctx)
 	p.DL.Queue(ctx, m.Models)
 
+	var spawnedAt time.Time
+	var spawnErr error
 	side := make(chan error, 1)
 	go func() {
-		_, err := p.installEnvironment(ctx, m)
+		_, err := p.installEnvironment(ctx, m, func() {
+			spawnedAt, spawnErr = time.Now(), p.startComfy(ctx)
+		})
 		side <- err
 	}()
 
@@ -132,19 +140,15 @@ func (p *Pipeline) Boot(ctx context.Context, m manifest.Manifest) {
 	}
 
 	st.SetPhase(state.PhaseStarting)
-	err = p.Procs.Start(ctx, procs.Spec{
-		Name:     "comfyui",
-		Argv:     []string{filepath.Join(p.Cfg.ComfyDir, "venv", "bin", "python"), "main.py", "--listen", "0.0.0.0", "--port", strconv.Itoa(p.Cfg.ComfyPort)},
-		Dir:      p.Cfg.ComfyDir,
-		LogPath:  p.Cfg.LogPath("comfyui"),
-		ReadyURL: fmt.Sprintf("http://127.0.0.1:%d/system_stats", p.Cfg.ComfyPort),
-	})
-	if err != nil {
-		st.Fail("comfy_start_failed", err.Error(), "")
+	if spawnErr != nil {
+		st.Fail("comfy_start_failed", spawnErr.Error(), "")
 		return
 	}
+	// The step covers only what is still left to wait for, which is what the
+	// app shows; ComfyUI's full startup time is the service's readyMs.
 	st.Step("comfyui-start", state.StepRunning, "waiting for /system_stats")
-	if err := p.Procs.WaitRunning(ctx, "comfyui", p.Cfg.ComfyStartTimeout); err != nil {
+	wait := max(time.Until(spawnedAt.Add(p.Cfg.ComfyStartTimeout)), time.Minute)
+	if err := p.Procs.WaitRunning(ctx, "comfyui", wait); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
@@ -155,6 +159,24 @@ func (p *Pipeline) Boot(ctx context.Context, m manifest.Manifest) {
 	st.Step("comfyui-start", state.StepDone, "")
 	st.SetPhase(state.PhaseReady)
 	slog.Info("ready")
+}
+
+func (p *Pipeline) startComfy(ctx context.Context) error {
+	return p.Procs.Start(ctx, procs.Spec{
+		Name:     "comfyui",
+		Argv:     []string{filepath.Join(p.Cfg.ComfyDir, "venv", "bin", "python"), "main.py", "--listen", "0.0.0.0", "--port", strconv.Itoa(p.Cfg.ComfyPort)},
+		Dir:      p.Cfg.ComfyDir,
+		LogPath:  p.Cfg.LogPath("comfyui"),
+		ReadyURL: fmt.Sprintf("http://127.0.0.1:%d/system_stats", p.Cfg.ComfyPort),
+	})
+}
+
+// logReport writes the launch's timings to the supervisor log, so a slow
+// launch can be explained after the fact without having watched it.
+func (p *Pipeline) logReport() {
+	for _, line := range p.St.Snapshot().Report() {
+		slog.Info("report " + line)
+	}
 }
 
 func (p *Pipeline) startAria2(ctx context.Context) error {
@@ -169,14 +191,19 @@ func (p *Pipeline) startAria2(ctx context.Context) error {
 }
 
 // installEnvironment installs extensions and pulls Ollama models. It
-// reports whether new extensions were installed.
-func (p *Pipeline) installEnvironment(ctx context.Context, m manifest.Manifest) (bool, error) {
+// reports whether new extensions were installed. afterExtensions, if set, runs
+// once the extensions are in and before the Ollama pulls, which nothing at
+// ComfyUI's startup waits on.
+func (p *Pipeline) installEnvironment(ctx context.Context, m manifest.Manifest, afterExtensions func()) (bool, error) {
 	p.installMu.Lock()
 	defer p.installMu.Unlock()
 
 	installed, err := install.Extensions(ctx, p.St, p.Run, p.Cfg.Workspace, p.Cfg.ComfyDir, m.Extensions)
 	if err != nil {
 		return installed, err
+	}
+	if afterExtensions != nil {
+		afterExtensions()
 	}
 	if len(m.OllamaModels) == 0 {
 		return installed, nil
@@ -236,7 +263,7 @@ func (p *Pipeline) Apply(ctx context.Context, m manifest.Manifest) error {
 	p.bg.Add(1)
 	go func() {
 		defer p.bg.Done()
-		installed, err := p.installEnvironment(ctx, m)
+		installed, err := p.installEnvironment(ctx, m, nil)
 		if installed {
 			p.St.SetRestartRequired(true)
 		}

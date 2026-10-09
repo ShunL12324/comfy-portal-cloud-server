@@ -67,12 +67,27 @@ func New(cfg Config, st *state.State, eng Engine, r *redact.Redactor) *Manager {
 
 // Preflight fails when the models cannot fit, before any bytes are spent.
 // It fills in sizes the manifest left at zero by asking the host.
+// The HEAD requests run in parallel: each is a round trip or two across the
+// world, and a template with twenty models would otherwise spend its first
+// seconds asking one host at a time.
 func (m *Manager) Preflight(ctx context.Context, models []manifest.Model) (needed int64, err error) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
 	for i := range models {
-		if models[i].SizeBytes == 0 {
-			models[i].SizeBytes = m.headSize(ctx, models[i].URL)
+		if models[i].SizeBytes != 0 {
+			continue
 		}
-		needed += models[i].SizeBytes
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			models[i].SizeBytes = m.headSize(ctx, models[i].URL)
+		}()
+	}
+	wg.Wait()
+	for _, model := range models {
+		needed += model.SizeBytes
 	}
 	free, ferr := m.cfg.FreeBytes(m.cfg.Workspace)
 	if ferr != nil {
