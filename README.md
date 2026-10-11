@@ -140,6 +140,32 @@ cpd health                 # exit 0 if it answers; the image's HEALTHCHECK
 cpd version
 ```
 
+## Progress lines
+
+From its first second `cpd` also prints one line about the launch to the container's log
+(PID 1's stdout, since the app starts it from vast's `onstart` with its own output sent to a
+file), whenever something changes and at most every 2 s (1 s for a new phase):
+
+```
+CP phase=preparing steps=0/0 t=0
+CP phase=downloading steps=8/9 step=extensions models=0/2 bytes=2147483648/7516192768 rate=220200960 t=12
+CP phase=ready steps=10/10 models=2/2 bytes=7516192768/7516192768 rate=0 t=37
+CP phase=failed steps=1/2 error=disk_full t=3
+```
+
+Each line stands alone, keys are fixed, numbers are plain integers (bytes, bytes per
+second, seconds since `cpd` started), and nothing comes from the manifest (`step=` is the
+running step's kind, never its URL); the line is redacted all the same. The app's parser
+for vast's `status_msg` reads them (`src/features/cloud/utils/pull-progress.ts`).
+
+What they reach, measured with `test/vast-timeline.sh` on two hosts: vast's container log
+(the console's log view, `vastai logs`, the `request_logs` API) gets every line. vast's
+`status_msg`, the only text the app sees before SSH, does **not**: it carries the image
+pull (the last one or two docker lines, refreshed about every 10 s) and vast's own
+`/ssh` image build, and then stays `success, running <image>/ssh` for the life of the
+instance. `cpd` answered through vast's SSH relay 4-13 s after that, so the app's first
+snapshot is what covers the supervisor's start, with each step's duration.
+
 ## Environment
 
 | | |
@@ -194,6 +220,7 @@ internal/procs      process supervision with backoff and readiness probes
 internal/install    directory links, extensions, Ollama, sshd
 internal/pipeline   the launch sequence, and applying manifests later
 internal/api        /v2, the /v1 shim, SSE, problem+json, openapi.json
+internal/progress   the one-line progress reports in the container log
 internal/redact     secret scrubbing
 internal/logs       log tailing and logger setup
 compat/             supervisor.py: a 3-line exec shim for older app builds
@@ -210,6 +237,7 @@ make build    # bin/cpd
 make image    # the full CUDA image (amd64 host, ~6 GB compressed)
 make vast-smoke IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-abc1234   # a few cents
 make vast-bench IMAGE=... [MACHINE=117918]   # time a realistic launch, a few cents
+make vast-timeline IMAGE=... OUT=run.jsonl    # what vast and cpd expose, every ~1.5 s
 ```
 
 `test/e2e.sh` covers the failures that have already happened: a model 404 must not stop the
@@ -241,6 +269,12 @@ nodes, a 6.9 GB Hugging Face checkpoint, a Civitai LoRA) and prints the pull tim
 vast's status, each phase as it is reached, `cpd report` and ComfyUI's slowest imports. Pin
 `MACHINE` to compare two images on one host; pull times only compare when neither image was
 cached there.
+
+`test/vast-timeline.sh` launches the same way and records, as JSON lines, vast's
+`actual_status`, `status_msg` and placement fields every ~1.5 s, when SSH and `cpd` (direct
+and through vast's relay) first answer, and `cpd`'s phase and steps after that. It also
+writes a line every 2 s to the container's stdout and fetches vast's container log, to see
+which of vast's channels carry it. The app's launch-progress fixtures come from these runs.
 
 CI (`.github/workflows/runtime-image.yml`) runs gofmt, vet, `go test -race` (with the app's
 TypeScript client as a contract check), golangci-lint and the e2e before it builds and

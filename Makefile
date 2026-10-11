@@ -1,4 +1,4 @@
-.PHONY: build test e2e lint image vast-smoke vast-bench
+.PHONY: build test e2e lint image vast-smoke vast-bench vast-timeline
 
 VERSION ?= dev
 
@@ -29,3 +29,9 @@ vast-smoke:
 vast-bench:
 	@test -n "$(IMAGE)" || { echo "usage: make vast-bench IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-... [MACHINE=id]"; exit 1; }
 	IMAGE=$(IMAGE) test/vast-bench.sh
+
+# Records what vast and cpd expose during a real launch, every ~1.5 s, as JSON
+# lines. Costs cents.
+vast-timeline:
+	@test -n "$(IMAGE)" && test -n "$(OUT)" || { echo "usage: make vast-timeline IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-... OUT=run.jsonl [MACHINE=id]"; exit 1; }
+	IMAGE=$(IMAGE) OUT=$(OUT) test/vast-timeline.sh

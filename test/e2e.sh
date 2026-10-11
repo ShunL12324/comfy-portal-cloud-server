@@ -69,6 +69,11 @@ wait_for "health" 10 curl -fs "$BASE/v2/health"
 
 step "boots to ready even though one model 404s"
 wait_for "ready" 60 phase_is ready
+
+step "progress lines in the log, from the first second to ready, without secrets"
+head -n 1 < <(grep '^CP ' "$WORK/cpd.out") | grep -q '^CP phase=preparing steps=0/0' || fail "first progress line: $(grep -m1 '^CP ' "$WORK/cpd.out")"
+wait_for "a ready line" 5 grep -q '^CP phase=ready .*models=2/3' "$WORK/cpd.out"
+! grep '^CP ' "$WORK/cpd.out" | grep -qE "$TOKEN|$HFTOKEN|http" || fail "a progress line leaks a secret or URL"
 SNAP=$(api "$BASE/v2/snapshot")
 echo "$SNAP" | jq -e '.models | length == 3' >/dev/null || fail "expected 3 models: $SNAP"
 echo "$SNAP" | jq -e '[.models[] | select(.state=="done")] | length == 2' >/dev/null || fail "expected 2 done"

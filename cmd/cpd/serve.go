@@ -22,6 +22,7 @@ import (
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/manifest"
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/pipeline"
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/procs"
+	"github.com/ShunL12324/comfy-portal-cloud-server/internal/progress"
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/redact"
 	"github.com/ShunL12324/comfy-portal-cloud-server/internal/state"
 )
@@ -48,6 +49,9 @@ func serve() error {
 	defer stop()
 
 	st := state.New(cfg.StatePath(), redactor)
+	// Progress lines start with the process, before anything that can be
+	// slow, so the container log says what is happening from the first second.
+	go (&progress.Reporter{St: st, Out: progress.ContainerLog(), Redactor: redactor}).Run(ctx)
 	supervisor := procs.New(st)
 	aria := aria2.New(cfg.Aria2Port, cfg.Aria2Secret)
 	dl := downloads.New(downloads.Config{
