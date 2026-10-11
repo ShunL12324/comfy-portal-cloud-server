@@ -148,8 +148,8 @@ file), whenever something changes and at most every 2 s (1 s for a new phase):
 
 ```
 CP phase=preparing steps=0/0 t=0
-CP phase=downloading steps=8/9 step=extensions models=0/2 bytes=2147483648/7516192768 rate=220200960 t=12
-CP phase=ready steps=10/10 models=2/2 bytes=7516192768/7516192768 rate=0 t=37
+CP phase=downloading steps=6/7 step=extension models=0/2 bytes=0/7166530678 rate=0 t=4
+CP phase=downloading steps=8/8 models=1/2 bytes=1171367928/7166530678 rate=101000306 t=18
 CP phase=failed steps=1/2 error=disk_full t=3
 ```
 
@@ -163,7 +163,7 @@ What they reach, measured with `test/vast-timeline.sh` on two hosts: vast's cont
 `status_msg`, the only text the app sees before SSH, does **not**: it carries the image
 pull (the last one or two docker lines, refreshed about every 10 s) and vast's own
 `/ssh` image build, and then stays `success, running <image>/ssh` for the life of the
-instance. `cpd` answered through vast's SSH relay 4-13 s after that, so the app's first
+instance. `cpd` answered through vast's SSH relay 4-16 s after that, so the app's first
 snapshot is what covers the supervisor's start, with each step's duration.
 
 ## Environment
