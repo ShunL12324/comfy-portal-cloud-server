@@ -1,0 +1,25 @@
+version: "2"
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - bodyclose
+    - noctx
+    - gosec
+  settings:
+    gosec:
+      excludes:
+        - G204 # commands are built from validated manifest fields, never a shell
+        - G304 # log paths come from a fixed stream allowlist
+        - G301
+        - G302
+        - G306
+  exclusions:
+    rules:
+      # Tests and the e2e rig talk to loopback servers they own; context
+      # plumbing and close-error checks there are noise.
+      - path: '(_test\.go|^test/)'
+        linters: [noctx, bodyclose, errcheck, gosec, errorlint]
+formatters:
+  enable:
+    - gofmt

@@ -4,101 +4,77 @@ name: Runtime image
 # releasing the app — that is driven by `release-*` tags in testflight.yml.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  # Run it by hand on a branch to build (and publish under a sha- tag) the
+  # image before merging.
   workflow_dispatch:
+    inputs:
+      compression:
+        description: >-
+          Layer compression. zstd pulls faster (measured on vast: 17% smaller,
+          unpacks 2.5x faster) but needs Docker 23+ on the host; it is
+          published under a -zstd tag suffix.
+        type: choice
+        options: [gzip, zstd]
+        default: gzip
+      cuda:
+        description: >-
+          torch's CUDA build. cu130 enables ComfyUI's fast CUDA 13 kernels
+          but needs a host driver of 580 or newer; published under a -cu130
+          tag suffix.
+        type: choice
+        options: [cu128, cu130]
+        default: cu128
 
 env:
   REGISTRY: ghcr.io
   # Lowercased in the Tags step: GHCR rejects uppercase names and this owner
   # has capitals.
-  IMAGE_NAME: comfy-portal-runtime
+  IMAGE_NAME: comfy-portal-cloud-server
 
 jobs:
-  # Fast gate. Exercises the supervisor against a stub ComfyUI and fixtures
-  # served over loopback — no CUDA, no network, no GPU — so a logic regression
-  # is caught in under a minute rather than by a rental.
-  supervisor-test:
+  # Fast gate: unit tests, then the real binary against real aria2c, a stub
+  # ComfyUI and fixture models over loopback. No CUDA, no network, no GPU, so a
+  # logic regression is caught in a couple of minutes rather than by a rental.
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The status contract is checked against the app's TypeScript client.
+      # The v1 compatibility shape is checked against the app's TypeScript client.
       - uses: actions/checkout@v4
         with:
           repository: ShunL12324/comfy-portal
           path: app
 
-      - name: Build test rig
-        run: docker build -f test/Dockerfile -t cp-supervisor-test .
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
-      - name: Smoke test
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet and unit tests
         run: |
-          MANIFEST=$(python3 -c "
-          import base64, json
-          print(base64.b64encode(json.dumps({
-            'version': 1,
-            'models': [
-              {'url': 'http://127.0.0.1:8000/tiny-model.safetensors', 'folder': 'checkpoints', 'filename': 't.safetensors'},
-              {'url': 'http://127.0.0.1:8000/second-model.safetensors', 'folder': 'loras', 'filename': 's.safetensors'},
-            ],
-            'extensions': [], 'ollamaModels': [],
-          }).encode()).decode())")
+          go vet ./...
+          CP_APP_DIR=$PWD/app go test -race ./...
 
-          docker run -d --name cp-test -p 18189:8189 \
-            -e CP_TOKEN=ci-token-abcdefgh -e CP_MANIFEST="$MANIFEST" cp-supervisor-test
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
 
-          for _ in $(seq 1 30); do
-            sleep 2
-            STATUS=$(curl -s -H "Authorization: Bearer ci-token-abcdefgh" http://localhost:18189/v1/status || true)
-            echo "$STATUS" | grep -q '"phase": "ready"' && break
-            echo "$STATUS" | grep -q '"phase": "failed"' && { echo "$STATUS"; exit 1; }
-          done
-
-          echo "$STATUS" | python3 -c "
-          import json, sys
-          d = json.load(sys.stdin)
-          assert d['phase'] == 'ready', d
-          assert d['totals']['completed'] == d['totals']['bytes'] > 0, d['totals']
-          print('ready:', d['totals'])"
-
-          # An unauthenticated request must not reach status; the port is public
-          # on a real instance.
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18189/v1/status)" = 401
-
-          # The supervisor and the app are written in different languages and
-          # live in different repositories; nothing but this stops a renamed
-          # field from silently becoming undefined on the phone.
-          echo "$STATUS" > /tmp/snapshot.json
-          python3 - <<'CONTRACT'
-          import json, re, sys
-          snapshot = json.load(open('/tmp/snapshot.json'))
-          ts = open('app/src/services/cloud-supervisor.ts').read()
-
-          def required(name, until):
-              # `field?:` is optional by design — errorCode only exists on a
-              # failure — so only non-optional fields must always be present.
-              block = ts[ts.index(f'export interface {name}'):ts.index(until)]
-              return set(re.findall(r'^\s{2}(\w+):', block, re.M))
-
-          problems = []
-          missing = required('SupervisorSnapshot', 'export class SupervisorError') - set(snapshot)
-          if missing:
-              problems.append(f'snapshot fields declared but not sent: {sorted(missing)}')
-
-          sent = set().union(*[set(m) for m in snapshot['models']])
-          missing = required('SupervisorModel', 'export interface SupervisorSnapshot') - sent
-          if missing:
-              problems.append(f'model fields declared but not sent: {sorted(missing)}')
-
-          if problems:
-              print('\n'.join(problems))
-              sys.exit(1)
-          print('client contract holds')
-          CONTRACT
-
-          docker rm -f cp-test
+      - name: End to end
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 jq
+          test/e2e.sh
 
   image:
-    needs: supervisor-test
+    needs: test
+    # Pull requests only test. Publishing happens from main, from v* tags and
+    # from a manual run.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -129,28 +105,73 @@ jobs:
           SHA=sha-$(git rev-parse --short HEAD)
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           BASE="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+          COMPRESSION="${{ inputs.compression || 'gzip' }}"
+          # A zstd or cu130 build is an experiment until the app pins it: it
+          # never takes a stable tag, only sha-...-cu130 / -zstd.
+          CUDA="${{ inputs.cuda || 'cu128' }}"
+          SUFFIX=""
+          if [ "$CUDA" = cu130 ]; then
+            SUFFIX=-cu130
+            {
+              echo 'cudaargs<<EOF'
+              echo 'CUDA_TAG=13.0.2-base-ubuntu22.04'
+              echo 'CUDA_APT=13-0'
+              echo 'TORCH_CUDA=13.0'
+              echo 'TORCH_INDEX=https://download.pytorch.org/whl/cu130'
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+          [ "$COMPRESSION" = zstd ] && SUFFIX=$SUFFIX-zstd
           # Only main gets the stable tag an app build is allowed to point at.
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          if [ "${{ github.ref }}" = "refs/heads/main" ] && [ -z "$SUFFIX" ]; then
             echo "base=${BASE}:${SHA},${BASE}:v1" >> "$GITHUB_OUTPUT"
             echo "ollama=${BASE}:${SHA}-ollama,${BASE}:v1-ollama" >> "$GITHUB_OUTPUT"
           else
-            echo "base=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
-            echo "ollama=${BASE}:${SHA}-ollama" >> "$GITHUB_OUTPUT"
+            echo "base=${BASE}:${SHA}${SUFFIX}" >> "$GITHUB_OUTPUT"
+            echo "ollama=${BASE}:${SHA}${SUFFIX}-ollama" >> "$GITHUB_OUTPUT"
           fi
-          echo "primary=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
+          # A v1.2.3 tag additionally publishes an immutable 1.2.3 image.
+          case "${{ github.ref }}" in
+            refs/tags/v*)
+              V="${GITHUB_REF_NAME#v}"
+              echo "base=${BASE}:${SHA},${BASE}:${V},${BASE}:v1" >> "$GITHUB_OUTPUT"
+              echo "ollama=${BASE}:${SHA}-ollama,${BASE}:${V}-ollama,${BASE}:v1-ollama" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          echo "primary=${BASE}:${SHA}${SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "version=${SHA}" >> "$GITHUB_OUTPUT"
+          # Branch builds read main's cache but write their own, so trying a
+          # branch never evicts the layers main's next build would reuse.
           echo "cacheref=${BASE}:buildcache" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref }}" = "refs/heads/main" ] || [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "cacheto=${BASE}:buildcache" >> "$GITHUB_OUTPUT"
+          else
+            echo "cacheto=${BASE}:buildcache-branch" >> "$GITHUB_OUTPUT"
+          fi
+          # OCI media types are required for zstd: docker cannot pull zstd
+          # layers labelled with the docker media type (docker/cli#5011).
+          if [ "$COMPRESSION" = zstd ]; then
+            echo "output=type=registry,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "output=type=registry" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push base
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
+          build-args: |
+            VERSION=${{ steps.tags.outputs.version }}
+            ${{ steps.tags.outputs.cudaargs }}
           # vast's GPU hosts are x86 only; an arm64 variant would never be pulled.
           platforms: linux/amd64
-          push: true
+          outputs: ${{ steps.tags.outputs.output }}
           tags: ${{ steps.tags.outputs.base }}
-          cache-from: type=registry,ref=${{ steps.tags.outputs.cacheref }}
-          cache-to: type=registry,ref=${{ steps.tags.outputs.cacheref }},mode=max
+          cache-from: |
+            type=registry,ref=${{ steps.tags.outputs.cacheref }}
+            type=registry,ref=${{ steps.tags.outputs.cacheref }}-branch
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cacheto }},mode=max
 
       - name: Build and push Ollama variant
         uses: docker/build-push-action@v6
@@ -158,7 +179,7 @@ jobs:
           context: .
           file: Dockerfile.ollama
           platforms: linux/amd64
-          push: true
+          outputs: ${{ steps.tags.outputs.output }}
           build-args: BASE=${{ steps.tags.outputs.primary }}
           tags: ${{ steps.tags.outputs.ollama }}
           cache-from: type=registry,ref=${{ steps.tags.outputs.cacheref }}
@@ -168,7 +189,7 @@ jobs:
           {
             echo "### Runtime image"
             echo ''
-            echo 'Point `IMAGE_*` in src/features/cloud/services/provision.ts (comfy-portal repo) at:'
+            echo 'Point `IMAGE_*` in the app (comfy-portal repo, src/features/cloud/services/) at:'
             echo ''
             echo '```'
             echo "${{ steps.tags.outputs.primary }}"
