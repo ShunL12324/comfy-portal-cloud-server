@@ -106,9 +106,14 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   echo "  instance $INSTANCE (label $LABEL)"
 
   step "wait for the container (image pull happens here)"
-  WAIT_START=$(date +%s); BAD_SINCE=""; HOST_BROKEN=""; SEEN_ACTIVE=""
+  WAIT_START=$(date +%s); BAD_SINCE=""; HOST_BROKEN=""; SEEN_ACTIVE=""; SEEN=""
   for i in $(seq 1 180); do
-    J=$(vast "$API/instances/$INSTANCE/" 2>/dev/null | jq -c '.instances // empty' 2>/dev/null || true)
+    R=$(vast "$API/instances/$INSTANCE/" 2>/dev/null || true)
+    # vast answers {"instances": null} for an instance that no longer exists.
+    [ -n "$SEEN" ] && echo "$R" | jq -e 'has("instances") and .instances == null' >/dev/null 2>&1 \
+      && { bad "instance $INSTANCE was destroyed outside this run"; INSTANCE=""; exit 1; }
+    J=$(echo "$R" | jq -c '.instances // empty' 2>/dev/null || true)
+    [ -n "$J" ] && SEEN=1
     STATUS=$(echo "$J" | jq -r '.actual_status // "?"' 2>/dev/null)
     MSG=$(echo "$J" | jq -r '.status_msg // ""' | tr -d '\n' | cut -c1-140)
     if [ "$STATUS" = running ]; then
