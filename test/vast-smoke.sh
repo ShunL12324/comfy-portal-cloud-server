@@ -6,7 +6,8 @@
 # curl on the box's loopback over SSH. The instance is ALWAYS destroyed on exit.
 #
 #   IMAGE=ghcr.io/shunl12324/comfy-portal-cloud-server:sha-abc1234 test/vast-smoke.sh
-#   OFFER=45607706 IMAGE=... test/vast-smoke.sh        # pin an offer
+#   OFFER=45607706 IMAGE=... test/vast-smoke.sh        # pin an offer (must be among the 30 cheapest)
+#   MACHINE=16146 IMAGE=... test/vast-smoke.sh         # try this host first (still under MAX_PRICE)
 #   KEEP=1 ...                                          # leave it running for debugging (you pay)
 #
 # Needs: VAST_API_KEY, curl, jq, ssh. Costs a few cents.
@@ -61,6 +62,7 @@ MANIFEST=$(jq -nc '{version:1,
 ONSTART=$'mkdir -p /workspace\nnohup /opt/comfyui/venv/bin/python /opt/cp/supervisor.py >> /workspace/supervisor-boot.log 2>&1 &'
 ENVSTR="-e CP_TOKEN=$TOKEN -e CP_MANIFEST=$MANIFEST -e COMFY_PORT=8188 -e CP_PORT=8189 -p 8188:8188 -p 8189:8189"
 EXCLUDE="${EXCLUDE_MACHINES:-}"   # space-separated machine ids known to be bad
+PIN_MACHINE=${MACHINE:-}           # MACHINE is reused below for the picked host
 ATTEMPTS=${ATTEMPTS:-4}
 # A daemon-level error in status_msg that persists this long means the host cannot
 # pull the image at all (seen: containerd "mkdir ... ingest" on a full store).
@@ -76,11 +78,14 @@ destroy_instance() {
 IP=""; SSHPORT=""; PUB8189=""; PUB8188=""
 for attempt in $(seq 1 "$ATTEMPTS"); do
   step "attempt $attempt/$ATTEMPTS: pick an offer"
-  OFFERS=$(vast -X POST "$API/bundles/" -d "$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" '{
+  # A pinned machine is asked for by id (bundles ignores an offer id filter), so it
+  # need not be among the 30 cheapest.
+  OFFERS=$(vast -X POST "$API/bundles/" -d "$(jq -nc --argjson p "$MAX_PRICE" --argjson d "$DISK" --arg m "$PIN_MACHINE" '{
       rentable:{eq:true}, type:"on-demand", num_gpus:{eq:1}, disk_space:{gte:($d+20)},
       reliability2:{gte:0.98}, inet_down:{gte:500}, direct_port_count:{gte:4}, cuda_max_good:{gte:12.8},
       gpu_name:{in:["RTX 3060","RTX 3070","RTX 3080","RTX 3090","RTX 4060","RTX 4070","RTX 4060 Ti","RTX 2060S"]},
-      dph_total:{lte:$p}, order:[["dph_total","asc"]], limit:30}')")
+      dph_total:{lte:$p}, order:[["dph_total","asc"]], limit:30}
+      + (if $m != "" then {machine_id:{eq:($m|tonumber)}} else {} end)')")
   PICK=$(echo "$OFFERS" | jq -c --arg pin "${OFFER:-}" --arg ex "$EXCLUDE" --arg cn "${ALLOW_CN:-0}" '
       ($ex | split(" ") | map(select(length > 0))) as $bad
       | [.offers[] | . as $o
@@ -95,7 +100,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   CREATED=$(vast -X PUT "$API/asks/$OFFER_ID/" -d "$(jq -nc --arg image "$IMAGE" --argjson disk "$DISK" --arg label "$LABEL" \
     --arg env "$ENVSTR" --arg onstart "$ONSTART" \
     '{image:$image, disk:$disk, runtype:"ssh_direct", label:$label, env:$env, onstart:$onstart}')") \
-    || { echo "  create failed (offer gone?)"; EXCLUDE="$EXCLUDE $MACHINE"; OFFER=""; continue; }
+    || { echo "  create failed (offer gone?)"; EXCLUDE="$EXCLUDE $MACHINE"; OFFER=""; PIN_MACHINE=""; continue; }
   INSTANCE=$(echo "$CREATED" | jq -r .new_contract)
   [ -n "$INSTANCE" ] && [ "$INSTANCE" != null ] || { echo "no instance id: $CREATED"; exit 1; }
   echo "  instance $INSTANCE (label $LABEL)"
@@ -112,6 +117,11 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
       [ -n "$SSHPORT" ] && break
     fi
     [ $((i % 6)) = 0 ] && echo "  status=$STATUS  $MSG"
+    # A host whose GPU injection is broken fails every container, whatever the
+    # image (seen with ubuntu:22.04 too), and vast gives up on it by itself.
+    case "$(echo "$J" | jq -r '.status_msg // ""')" in *"failed to inject CDI devices"*)
+      HOST_BROKEN="cannot inject the GPU (unresolvable CDI devices)"; break;; esac
+    [ "$(echo "$J" | jq -r '.intended_status // ""')" = stopped ] && { HOST_BROKEN="vast stopped it: $MSG"; break; }
     case "$MSG" in *"Error response from daemon"*)
       BAD_SINCE=${BAD_SINCE:-$(date +%s)}
       [ $(( $(date +%s) - BAD_SINCE )) -ge "$HOST_BROKEN_AFTER" ] && { HOST_BROKEN="$MSG"; break; };;
@@ -123,7 +133,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   done
   [ -n "$SSHPORT" ] && break
   echo "  host $MACHINE is broken: ${HOST_BROKEN:-never became reachable in 30 min}"
-  destroy_instance "$INSTANCE"; INSTANCE=""; EXCLUDE="$EXCLUDE $MACHINE"; OFFER=""
+  destroy_instance "$INSTANCE"; INSTANCE=""; EXCLUDE="$EXCLUDE $MACHINE"; OFFER=""; PIN_MACHINE=""
 done
 [ -n "$SSHPORT" ] || { bad "no host could run the image after $ATTEMPTS attempts"; exit 1; }
 PULL_S=$(( $(date +%s) - T0 ))

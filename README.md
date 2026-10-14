@@ -255,6 +255,14 @@ a manifest, graceful shutdown and a resuming relaunch. Needs `VAST_API_KEY`; a r
 cents. Hosts whose docker daemon is broken (`unresolvable CDI devices`, containerd errors,
 never starting) are detected, destroyed and skipped automatically.
 
+`failed to inject CDI devices: unresolvable CDI devices D.<container id>` is the host, not
+the image: on those machines vast's per-container GPU device never resolves, so every
+container fails before it starts, `ubuntu:22.04` with a bare request included (checked
+October 2026 on machines 16146 and 34763). The instance stays `created`, bills only storage,
+and vast sets `intended_status=stopped` within about three minutes. Many such hosts are
+`deverified` but still listed by `/bundles/`; the only cure on the renting side is another
+machine.
+
 It exists because two bugs were invisible to every other test:
 
 - vast starts its own `sshd`, which needs host keys. The image ships none (baked-in keys
